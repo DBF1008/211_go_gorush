@@ -3,6 +3,7 @@ package router
 import (
 	"context"
 	"crypto/tls"
+	"fmt"
 	"io"
 	"log"
 	"net/http"
@@ -851,5 +852,160 @@ func TestCountNotificationTargets(t *testing.T) {
 			got := countNotificationTargets(tt.notification)
 			assert.Equal(t, tt.want, got)
 		})
+	}
+}
+
+// TestHandleNotificationDoesNotMutateConfigSync verifies that handling a request
+// never writes back to the shared cfg.Core.Sync. Previously a non-local-queue
+// request flipped cfg.Core.Sync to false, leaking into concurrent and
+// subsequent requests.
+func TestHandleNotificationDoesNotMutateConfigSync(t *testing.T) {
+	ctx := context.Background()
+	cfg := initTest()
+
+	// Sync requested, but the configured queue is a non-local (external) engine,
+	// for which sync mode cannot apply.
+	cfg.Core.Sync = true
+	cfg.Queue.Engine = string(core.NSQ)
+
+	// Disable every platform so no notification is actually dispatched. This
+	// keeps the test free of any network or credential dependency while still
+	// exercising the sync-mode decision.
+	cfg.Ios.Enabled = false
+	cfg.Android.Enabled = false
+	cfg.Huawei.Enabled = false
+
+	req := notify.RequestPush{
+		Notifications: []notify.PushNotification{
+			{
+				Tokens:   []string{"token"},
+				Platform: core.PlatFormIos,
+				Message:  "should not be sent",
+			},
+		},
+	}
+
+	count, logs := handleNotification(ctx, cfg, req, q)
+
+	assert.Equal(t, 0, count)
+	assert.Empty(t, logs)
+	assert.True(
+		t,
+		cfg.Core.Sync,
+		"handleNotification must not mutate the shared cfg.Core.Sync",
+	)
+}
+
+// TestSyncModeAggregatesLogsConcurrently exercises the synchronous local-queue
+// path with many notifications processed by concurrent workers and asserts that
+// every log is collected (no lost updates) and that aggregation preserves
+// request order. Run with `-race` to detect concurrent access to shared state.
+func TestSyncModeAggregatesLogsConcurrently(t *testing.T) {
+	ctx := context.Background()
+	cfg := initTest()
+
+	// Local queue + sync mode selects the synchronous dispatch path.
+	cfg.Queue.Engine = string(core.LocalQueue)
+	cfg.Core.Sync = true
+	cfg.Ios.Enabled = true
+
+	// Replace the real sender with a deterministic stub so the test does not
+	// depend on any push backend. The sleep widens the window in which the
+	// queue workers run concurrently, surfacing data races under `go test -race`.
+	original := sendNotification
+	defer func() { sendNotification = original }()
+	sendNotification = func(
+		_ context.Context, msg qcore.TaskMessage, _ *config.ConfYaml,
+	) (*notify.ResponsePush, error) {
+		n, ok := msg.(*notify.PushNotification)
+		require.True(t, ok)
+		time.Sleep(time.Millisecond)
+		entries := make([]logx.LogPushEntry, 0, len(n.Tokens))
+		for _, token := range n.Tokens {
+			entries = append(entries, logx.LogPushEntry{Token: token, Message: n.Message})
+		}
+		return &notify.ResponsePush{Logs: entries}, nil
+	}
+
+	// A dedicated pool with several workers guarantees real concurrency
+	// regardless of the host's GOMAXPROCS / CPU count.
+	pool := queue.NewPool(
+		4,
+		queue.WithFn(func(_ context.Context, _ qcore.TaskMessage) error { return nil }),
+		queue.WithLogger(logx.QueueLogger()),
+	)
+	defer pool.Release()
+
+	const total = 50
+	notifications := make([]notify.PushNotification, 0, total)
+	for i := range total {
+		notifications = append(notifications, notify.PushNotification{
+			Tokens:   []string{fmt.Sprintf("token-%d", i)},
+			Platform: core.PlatFormIos,
+			Message:  fmt.Sprintf("message-%d", i),
+		})
+	}
+
+	count, logs := handleNotification(
+		ctx, cfg, notify.RequestPush{Notifications: notifications}, pool,
+	)
+
+	assert.Equal(t, total, count)
+	require.Len(t, logs, total)
+	// Each task writes to its own slot, flattened in order, so logs must come
+	// back in request order.
+	for i := range total {
+		assert.Equal(t, fmt.Sprintf("token-%d", i), logs[i].Token)
+	}
+}
+
+// TestSyncModeEnqueueErrorDoesNotDeadlock verifies that when QueueTask fails to
+// schedule a task (here, because the pool is already released), the wait group
+// is still released so the request returns instead of hanging, and a failure
+// log is recorded for the affected notification.
+func TestSyncModeEnqueueErrorDoesNotDeadlock(t *testing.T) {
+	cfg := initTest()
+	cfg.Ios.Enabled = true
+
+	// Stub the sender so that even if a task were unexpectedly scheduled, it
+	// would not touch any push backend and would yield one log entry per token,
+	// matching the failure path's shape.
+	original := sendNotification
+	defer func() { sendNotification = original }()
+	sendNotification = func(
+		_ context.Context, msg qcore.TaskMessage, _ *config.ConfYaml,
+	) (*notify.ResponsePush, error) {
+		n := msg.(*notify.PushNotification)
+		entries := make([]logx.LogPushEntry, 0, len(n.Tokens))
+		for _, token := range n.Tokens {
+			entries = append(entries, logx.LogPushEntry{Token: token})
+		}
+		return &notify.ResponsePush{Logs: entries}, nil
+	}
+
+	// A released pool rejects QueueTask, exercising the enqueue-error branch.
+	pool := queue.NewPool(
+		1,
+		queue.WithFn(func(_ context.Context, _ qcore.TaskMessage) error { return nil }),
+		queue.WithLogger(logx.QueueLogger()),
+	)
+	pool.Release()
+
+	notifications := []*notify.PushNotification{
+		{Tokens: []string{"a"}, Platform: core.PlatFormIos, Message: "x"},
+		{Tokens: []string{"b"}, Platform: core.PlatFormIos, Message: "y"},
+	}
+
+	done := make(chan []logx.LogPushEntry, 1)
+	go func() {
+		done <- pushNotificationsSync(cfg, notifications, pool)
+	}()
+
+	select {
+	case logs := <-done:
+		// One failure log entry per token across both notifications.
+		assert.Len(t, logs, 2)
+	case <-time.After(2 * time.Second):
+		t.Fatal("pushNotificationsSync deadlocked when QueueTask returned an error")
 	}
 }

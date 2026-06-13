@@ -32,6 +32,11 @@ import (
 
 var doOnce sync.Once
 
+// sendNotification delivers a single notification. It is a package variable so
+// tests can substitute a deterministic, network-free stub for the real push
+// implementation when exercising the synchronous dispatch path.
+var sendNotification = notify.SendNotification
+
 func abortWithError(c *gin.Context, code int, message string) {
 	c.AbortWithStatusJSON(code, gin.H{
 		"code":    code,
@@ -287,52 +292,88 @@ func handleNotification(
 	req notify.RequestPush,
 	q *queue.Queue,
 ) (int, []logx.LogPushEntry) {
-	if cfg.Core.Sync && !core.IsLocalQueue(core.Queue(cfg.Queue.Engine)) {
-		cfg.Core.Sync = false
-	}
-
 	notifications := filterEnabledNotifications(cfg, req.Notifications)
-	isLocalSync := core.IsLocalQueue(core.Queue(cfg.Queue.Engine)) && cfg.Core.Sync
 
-	var (
-		count int
-		wg    sync.WaitGroup
-		logs  = make([]logx.LogPushEntry, 0)
-	)
+	// Decide whether to process the request synchronously. Sync mode is only
+	// meaningful for the in-process (local) queue: only there can we block until
+	// every notification has been processed and return the real logs. For
+	// external queues (NSQ/NATS/Redis) the request is always handled
+	// asynchronously.
+	//
+	// This is derived into a local variable instead of writing back to
+	// cfg.Core.Sync. cfg is shared by every request, so mutating it here would
+	// race with, and leak into, concurrent and subsequent requests.
+	syncMode := cfg.Core.Sync && core.IsLocalQueue(core.Queue(cfg.Queue.Engine))
 
+	count := 0
 	for _, notification := range notifications {
-		if cfg.Core.Sync {
-			wg.Add(1)
-		}
-
-		if isLocalSync {
-			func(msg *notify.PushNotification, cfg *config.ConfYaml) {
-				if err := q.QueueTask(func(ctx context.Context) error {
-					defer wg.Done()
-					resp, err := notify.SendNotification(ctx, msg, cfg)
-					if err != nil {
-						return err
-					}
-					logs = append(logs, resp.Logs...)
-					return nil
-				}); err != nil {
-					logx.LogError.Error(err)
-				}
-			}(notification, cfg)
-		} else if err := q.Queue(notification); err != nil {
-			resp := markFailedNotification(cfg, notification, "max capacity reached")
-			logs = append(logs, resp...)
-			wg.Done()
-		}
-
 		count += countNotificationTargets(notification)
 	}
 
-	if cfg.Core.Sync {
-		wg.Wait()
+	var logs []logx.LogPushEntry
+	if syncMode {
+		logs = pushNotificationsSync(cfg, notifications, q)
+	} else {
+		logs = make([]logx.LogPushEntry, 0)
+		for _, notification := range notifications {
+			if err := q.Queue(notification); err != nil {
+				logs = append(
+					logs,
+					markFailedNotification(cfg, notification, "max capacity reached")...,
+				)
+			}
+		}
 	}
 
 	status.StatStorage.AddTotalCount(int64(count))
 
 	return count, logs
+}
+
+// pushNotificationsSync enqueues each notification on the local queue and blocks
+// until all of them have been processed, returning the aggregated push logs in
+// request order.
+//
+// Concurrency safety: every task writes its logs into its own pre-allocated slot
+// of results, so the queue workers that run concurrently never share a mutable
+// slice (no concurrent append). The slots are only read and flattened after
+// wg.Wait returns, which establishes a happens-before relationship with every
+// task's write.
+func pushNotificationsSync(
+	cfg *config.ConfYaml,
+	notifications []*notify.PushNotification,
+	q *queue.Queue,
+) []logx.LogPushEntry {
+	var wg sync.WaitGroup
+	results := make([][]logx.LogPushEntry, len(notifications))
+
+	for i, notification := range notifications {
+		wg.Add(1)
+		err := q.QueueTask(func(ctx context.Context) error {
+			defer wg.Done()
+			resp, err := sendNotification(ctx, notification, cfg)
+			if err != nil {
+				return err
+			}
+			results[i] = resp.Logs
+			return nil
+		})
+		if err != nil {
+			// The task was never scheduled, so its callback (and the deferred
+			// wg.Done) will never run. Release the wait group here to avoid a
+			// deadlock in wg.Wait below, and record the failure so the client
+			// still receives a log entry, matching the asynchronous path.
+			results[i] = markFailedNotification(cfg, notification, "max capacity reached")
+			wg.Done()
+		}
+	}
+
+	wg.Wait()
+
+	logs := make([]logx.LogPushEntry, 0, len(notifications))
+	for _, r := range results {
+		logs = append(logs, r...)
+	}
+
+	return logs
 }
