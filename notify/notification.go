@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 
 	"github.com/appleboy/gorush/config"
 	"github.com/appleboy/gorush/core"
@@ -285,18 +286,23 @@ func SendNotification(
 			logs = makeErrorLogs(cfg, v, err)
 		}
 
+		var wg sync.WaitGroup
 		for _, l := range logs {
-			err := DispatchFeedback(
-				ctx,
-				l,
-				cfg.Core.FeedbackURL,
-				cfg.Core.FeedbackTimeout,
-				cfg.Core.FeedbackHeader,
-			)
-			if err != nil {
-				logx.LogError.Error(err)
-			}
+			wg.Add(1)
+			go func(entry logx.LogPushEntry) {
+				defer wg.Done()
+				if fbErr := DispatchFeedback(
+					ctx,
+					entry,
+					cfg.Core.FeedbackURL,
+					cfg.Core.FeedbackTimeout,
+					cfg.Core.FeedbackHeader,
+				); fbErr != nil {
+					logx.LogError.Error(fbErr)
+				}
+			}(l)
 		}
+		wg.Wait()
 	}
 
 	return resp, err

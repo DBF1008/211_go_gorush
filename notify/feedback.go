@@ -11,13 +11,15 @@ import (
 	"github.com/appleboy/gorush/logx"
 )
 
-// extractHeaders converts a slice of strings to a map of strings.
+// extractHeaders converts a slice of "Key: Value" strings to a map.
+// It uses SplitN with n=2 so that header values containing colons
+// (e.g. Bearer tokens, HMAC signatures) are preserved intact.
 func extractHeaders(headers []string) map[string]string {
-	result := make(map[string]string)
+	result := make(map[string]string, len(headers))
 	for _, header := range headers {
-		parts := strings.Split(header, ":")
+		parts := strings.SplitN(header, ":", 2)
 		if len(parts) == 2 {
-			result[parts[0]] = parts[1]
+			result[strings.TrimSpace(parts[0])] = strings.TrimSpace(parts[1])
 		}
 	}
 	return result
@@ -59,13 +61,16 @@ func DispatchFeedback(
 
 	headers := extractHeaders(header)
 	for k, v := range headers {
-		req.Header.Set(k, strings.TrimSpace(v))
+		req.Header.Set(k, v)
 	}
 
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-	feedbackClient.Timeout = time.Duration(timeout) * time.Second
-	resp, err := feedbackClient.Do(req)
+	// Create a local client to avoid mutating the shared feedbackClient.Timeout
+	// which would cause a data race under concurrent dispatch calls.
+	// The context.WithTimeout above already enforces the deadline.
+	client := &http.Client{Transport: feedbackClient.Transport}
+	resp, err := client.Do(req)
 
 	if resp != nil {
 		defer resp.Body.Close()
