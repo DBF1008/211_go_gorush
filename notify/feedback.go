@@ -11,14 +11,25 @@ import (
 	"github.com/appleboy/gorush/logx"
 )
 
-// extractHeaders converts a slice of strings to a map of strings.
+// extractHeaders converts a slice of "Key: Value" strings into a header map.
+//
+// Each entry is split on the first colon only, so values that themselves
+// contain colons — bearer tokens, timestamped signatures (e.g. "t=1700:v1=ab"),
+// or URLs with ports — are preserved intact instead of being truncated or
+// silently dropped. Keys and values are trimmed; entries without a colon or
+// with an empty key are skipped.
 func extractHeaders(headers []string) map[string]string {
-	result := make(map[string]string)
+	result := make(map[string]string, len(headers))
 	for _, header := range headers {
-		parts := strings.Split(header, ":")
-		if len(parts) == 2 {
-			result[parts[0]] = parts[1]
+		parts := strings.SplitN(header, ":", 2)
+		if len(parts) != 2 {
+			continue
 		}
+		key := strings.TrimSpace(parts[0])
+		if key == "" {
+			continue
+		}
+		result[key] = strings.TrimSpace(parts[1])
 	}
 	return result
 }
@@ -57,14 +68,16 @@ func DispatchFeedback(
 		return err
 	}
 
-	headers := extractHeaders(header)
-	for k, v := range headers {
-		req.Header.Set(k, strings.TrimSpace(v))
+	for k, v := range extractHeaders(header) {
+		req.Header.Set(k, v)
 	}
-
 	req.Header.Set("Content-Type", "application/json; charset=utf-8")
 
-	feedbackClient.Timeout = time.Duration(timeout) * time.Second
+	// The per-request timeout is enforced via the request context above. We
+	// deliberately do NOT mutate the shared feedbackClient.Timeout here: that
+	// field is package-global, so writing it on every call races with other
+	// in-flight feedback dispatches. http.Client.Do is safe for concurrent use
+	// as long as the client itself is not mutated.
 	resp, err := feedbackClient.Do(req)
 
 	if resp != nil {

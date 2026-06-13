@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/url"
 	"os"
+	"sync"
 
 	"github.com/appleboy/gorush/config"
 	"github.com/appleboy/gorush/core"
@@ -285,18 +286,27 @@ func SendNotification(
 			logs = makeErrorLogs(cfg, v, err)
 		}
 
+		// Dispatch feedback for each log entry concurrently. The feedback
+		// sending layer is concurrency-safe (it no longer mutates shared client
+		// state and builds an independent request per call), so fanning out here
+		// avoids the head-of-line blocking of the previous per-token serial loop.
+		var wg sync.WaitGroup
+		wg.Add(len(logs))
 		for _, l := range logs {
-			err := DispatchFeedback(
-				ctx,
-				l,
-				cfg.Core.FeedbackURL,
-				cfg.Core.FeedbackTimeout,
-				cfg.Core.FeedbackHeader,
-			)
-			if err != nil {
-				logx.LogError.Error(err)
-			}
+			go func(entry logx.LogPushEntry) {
+				defer wg.Done()
+				if err := DispatchFeedback(
+					ctx,
+					entry,
+					cfg.Core.FeedbackURL,
+					cfg.Core.FeedbackTimeout,
+					cfg.Core.FeedbackHeader,
+				); err != nil {
+					logx.LogError.Error(err)
+				}
+			}(l)
 		}
+		wg.Wait()
 	}
 
 	return resp, err
