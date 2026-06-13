@@ -476,6 +476,12 @@ func PushToIOS(
 		maxRetry = req.Retry
 	}
 
+	// check message
+	if err = CheckMessage(req); err != nil {
+		logx.LogError.Error("request error: " + err.Error())
+		return nil, err
+	}
+
 	resp = &ResponsePush{}
 
 Retry:

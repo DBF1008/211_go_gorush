@@ -18,22 +18,39 @@ type CLISendOptions struct {
 	Topic   string
 }
 
+// buildCLIRequest builds and normalizes a PushNotification from CLI options.
+// It maps Token → To and Topic → Topic, then calls CheckMessage to fold To
+// into Tokens and perform platform-specific validation. To is cleared after
+// normalization so that downstream PushToXyz functions (which may call
+// CheckMessage again internally) do not duplicate the token.
+func buildCLIRequest(opts CLISendOptions, platform int) (*notify.PushNotification, error) {
+	req := &notify.PushNotification{
+		Platform: platform,
+		Message:  opts.Message,
+		Title:    opts.Title,
+		To:       opts.Token,
+		Topic:    opts.Topic,
+	}
+
+	// Normalize: fold To → Tokens and validate.
+	if err := notify.CheckMessage(req); err != nil {
+		return nil, err
+	}
+
+	// Clear To so a second CheckMessage (inside PushToAndroid/PushToHuawei)
+	// does not re-append it and cause duplicate sends.
+	req.To = ""
+
+	return req, nil
+}
+
 // SendAndroidNotification sends an Android notification via CLI.
 func SendAndroidNotification(ctx context.Context, cfg *config.ConfYaml, opts CLISendOptions) error {
 	cfg.Android.Enabled = true
 
-	req := &notify.PushNotification{
-		Platform: core.PlatFormAndroid,
-		Message:  opts.Message,
-		Title:    opts.Title,
-	}
-
-	if opts.Token != "" {
-		req.To = opts.Token
-	}
-
-	if opts.Topic != "" {
-		req.Topic = opts.Topic
+	req, err := buildCLIRequest(opts, core.PlatFormAndroid)
+	if err != nil {
+		return err
 	}
 
 	if err := status.InitAppStatus(cfg); err != nil {
@@ -51,21 +68,8 @@ func SendAndroidNotification(ctx context.Context, cfg *config.ConfYaml, opts CLI
 func SendHuaweiNotification(ctx context.Context, cfg *config.ConfYaml, opts CLISendOptions) error {
 	cfg.Huawei.Enabled = true
 
-	req := &notify.PushNotification{
-		Platform: core.PlatFormHuawei,
-		Message:  opts.Message,
-		Title:    opts.Title,
-	}
-
-	if opts.Token != "" {
-		req.Tokens = []string{opts.Token}
-	}
-
-	if opts.Topic != "" {
-		req.To = opts.Topic
-	}
-
-	if err := notify.CheckMessage(req); err != nil {
+	req, err := buildCLIRequest(opts, core.PlatFormHuawei)
+	if err != nil {
 		return err
 	}
 
@@ -84,21 +88,8 @@ func SendHuaweiNotification(ctx context.Context, cfg *config.ConfYaml, opts CLIS
 func SendIOSNotification(ctx context.Context, cfg *config.ConfYaml, opts CLISendOptions) error {
 	cfg.Ios.Enabled = true
 
-	req := &notify.PushNotification{
-		Platform: core.PlatFormIos,
-		Message:  opts.Message,
-		Title:    opts.Title,
-	}
-
-	if opts.Token != "" {
-		req.Tokens = []string{opts.Token}
-	}
-
-	if opts.Topic != "" {
-		req.Topic = opts.Topic
-	}
-
-	if err := notify.CheckMessage(req); err != nil {
+	req, err := buildCLIRequest(opts, core.PlatFormIos)
+	if err != nil {
 		return err
 	}
 
