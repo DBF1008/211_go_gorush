@@ -55,7 +55,58 @@ func InitFCMClient(ctx context.Context, cfg *config.ConfYaml) (*fcm.Client, erro
 	return FCMClient, err
 }
 
-// setupFCMNotification sets up the notification fields on the request.
+// The setup* helpers below each contribute a single capability (notification
+// body, mutable-content, background/content-available, sound) to the outgoing
+// FCM message. They merge into whatever APNS/Android structs the request already
+// has instead of replacing them wholesale, so the capabilities compose safely
+// regardless of call order and never clobber fields written by a sibling helper.
+
+// ensureAPNS returns req.APNS, allocating it if necessary.
+func ensureAPNS(req *PushNotification) *messaging.APNSConfig {
+	if req.APNS == nil {
+		req.APNS = &messaging.APNSConfig{}
+	}
+	return req.APNS
+}
+
+// ensureAPNSAps returns the APNS aps payload, allocating the nested
+// APNSConfig/APNSPayload/Aps chain as needed so a single field can be set
+// without overwriting its siblings.
+func ensureAPNSAps(req *PushNotification) *messaging.Aps {
+	apns := ensureAPNS(req)
+	if apns.Payload == nil {
+		apns.Payload = &messaging.APNSPayload{}
+	}
+	if apns.Payload.Aps == nil {
+		apns.Payload.Aps = &messaging.Aps{}
+	}
+	return apns.Payload.Aps
+}
+
+// ensureAPNSHeaders returns the APNS headers map, allocating it if necessary so
+// a header can be added without dropping any already present.
+func ensureAPNSHeaders(req *PushNotification) map[string]string {
+	apns := ensureAPNS(req)
+	if apns.Headers == nil {
+		apns.Headers = make(map[string]string)
+	}
+	return apns.Headers
+}
+
+// ensureAndroidNotification returns the Android notification config, allocating
+// the nested AndroidConfig/AndroidNotification chain as needed.
+func ensureAndroidNotification(req *PushNotification) *messaging.AndroidNotification {
+	if req.Android == nil {
+		req.Android = &messaging.AndroidConfig{Priority: req.Priority}
+	}
+	if req.Android.Notification == nil {
+		req.Android.Notification = &messaging.AndroidNotification{}
+	}
+	return req.Android.Notification
+}
+
+// setupFCMNotification sets the cross-platform notification body (title, body,
+// image) on the request.
 func setupFCMNotification(req *PushNotification) {
 	if req.Title == "" && req.Message == "" && req.Image == "" {
 		return
@@ -72,56 +123,31 @@ func setupFCMNotification(req *PushNotification) {
 	if req.Image != "" {
 		req.Notification.ImageURL = req.Image
 	}
-	if req.MutableContent {
-		req.APNS = &messaging.APNSConfig{
-			Payload: &messaging.APNSPayload{
-				Aps: &messaging.Aps{
-					MutableContent: req.MutableContent,
-				},
-			},
-		}
-	}
 }
 
-// setupFCMContentAvailable sets up the content available config for background notifications.
+// setupFCMMutableContent enables the iOS mutable-content flag. It is independent
+// of the alert body so silent pushes (which carry no body) can still request it.
+func setupFCMMutableContent(req *PushNotification) {
+	if !req.MutableContent {
+		return
+	}
+	ensureAPNSAps(req).MutableContent = true
+}
+
+// setupFCMContentAvailable enables a background (content-available) push,
+// merging into any APNS config built by the other helpers.
 func setupFCMContentAvailable(req *PushNotification) {
 	if !req.ContentAvailable {
 		return
 	}
-	req.APNS = &messaging.APNSConfig{
-		Headers: map[string]string{
-			"apns-priority": "5",
-		},
-		Payload: &messaging.APNSPayload{
-			Aps: &messaging.Aps{
-				ContentAvailable: req.ContentAvailable,
-				CustomData:       req.Data,
-			},
-		},
-	}
+	aps := ensureAPNSAps(req)
+	aps.ContentAvailable = true
+	aps.CustomData = req.Data
+	ensureAPNSHeaders(req)["apns-priority"] = "5"
 }
 
-// setAPNSSound sets the sound on the APNS config, initializing nested structs as needed.
-func setAPNSSound(req *PushNotification, sound string) {
-	switch {
-	case req.APNS == nil:
-		req.APNS = &messaging.APNSConfig{
-			Payload: &messaging.APNSPayload{
-				Aps: &messaging.Aps{Sound: sound},
-			},
-		}
-	case req.APNS.Payload == nil:
-		req.APNS.Payload = &messaging.APNSPayload{
-			Aps: &messaging.Aps{Sound: sound},
-		}
-	case req.APNS.Payload.Aps == nil:
-		req.APNS.Payload.Aps = &messaging.Aps{Sound: sound}
-	default:
-		req.APNS.Payload.Aps.Sound = sound
-	}
-}
-
-// setupFCMSound sets up the sound configuration for FCM notifications.
+// setupFCMSound sets the notification sound on both the APNS and Android
+// configs, merging into any structs built by the other helpers.
 func setupFCMSound(req *PushNotification) {
 	if req.Sound == nil {
 		return
@@ -130,15 +156,8 @@ func setupFCMSound(req *PushNotification) {
 	if !ok {
 		return
 	}
-	setAPNSSound(req, sound)
-	if req.Android == nil {
-		req.Android = &messaging.AndroidConfig{
-			Priority: req.Priority,
-			Notification: &messaging.AndroidNotification{
-				Sound: sound,
-			},
-		}
-	}
+	ensureAPNSAps(req).Sound = sound
+	ensureAndroidNotification(req).Sound = sound
 }
 
 // convertDataToStringMap converts the request data to a string map.
@@ -180,6 +199,7 @@ func buildFCMMessage(req *PushNotification, data map[string]string) *messaging.M
 // https://firebase.google.com/docs/cloud-messaging/http-server-ref
 func GetAndroidNotification(req *PushNotification) []*messaging.Message {
 	setupFCMNotification(req)
+	setupFCMMutableContent(req)
 	setupFCMContentAvailable(req)
 	setupFCMSound(req)
 

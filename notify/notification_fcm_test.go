@@ -474,3 +474,123 @@ func TestGetAndroidNotificationWithTopicAndTokens(t *testing.T) {
 	assert.Equal(t, "token1", messages[1].Token)
 	assert.Equal(t, "token2", messages[2].Token)
 }
+
+// TestSetupFCMCompositeLayering exercises a silent (content-available) push that
+// also requests mutable-content and a sound. These capabilities used to clobber
+// one another because content-available reassigned req.APNS wholesale; they must
+// now all coexist on the same APNS payload.
+func TestSetupFCMCompositeLayering(t *testing.T) {
+	data := D{"k": "v"}
+	req := &PushNotification{
+		Tokens:           []string{"token"},
+		Priority:         HIGH,
+		MutableContent:   true,
+		ContentAvailable: true,
+		Sound:            "default",
+		Data:             data,
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	require.NotNil(t, msg.APNS)
+	require.NotNil(t, msg.APNS.Payload)
+	require.NotNil(t, msg.APNS.Payload.Aps)
+	aps := msg.APNS.Payload.Aps
+
+	assert.True(t, aps.MutableContent, "mutable-content must survive content-available")
+	assert.True(t, aps.ContentAvailable)
+	assert.Equal(t, "default", aps.Sound, "sound must survive content-available")
+	assert.Equal(t, data, D(aps.CustomData))
+	assert.Equal(t, "5", msg.APNS.Headers["apns-priority"])
+
+	// Android sound is configured for the same request as well.
+	require.NotNil(t, msg.Android)
+	require.NotNil(t, msg.Android.Notification)
+	assert.Equal(t, "default", msg.Android.Notification.Sound)
+	assert.Equal(t, HIGH, msg.Android.Priority)
+}
+
+// TestSetupFCMCompositeWithBody verifies an alert push carrying a body together
+// with mutable-content, content-available and a sound keeps every field.
+func TestSetupFCMCompositeWithBody(t *testing.T) {
+	req := &PushNotification{
+		Tokens:           []string{"token"},
+		Title:            "Hi",
+		Message:          "Body",
+		MutableContent:   true,
+		ContentAvailable: true,
+		Sound:            "ping.aiff",
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	require.NotNil(t, msg.Notification)
+	assert.Equal(t, "Hi", msg.Notification.Title)
+	assert.Equal(t, "Body", msg.Notification.Body)
+
+	require.NotNil(t, msg.APNS)
+	require.NotNil(t, msg.APNS.Payload)
+	require.NotNil(t, msg.APNS.Payload.Aps)
+	aps := msg.APNS.Payload.Aps
+	assert.True(t, aps.MutableContent)
+	assert.True(t, aps.ContentAvailable)
+	assert.Equal(t, "ping.aiff", aps.Sound)
+	assert.Equal(t, "5", msg.APNS.Headers["apns-priority"])
+}
+
+// TestSetupFCMMutableContentWithoutBody ensures a push with no alert body still
+// honors the mutable-content flag, which matters for silent pushes.
+func TestSetupFCMMutableContentWithoutBody(t *testing.T) {
+	req := &PushNotification{
+		Tokens:         []string{"token"},
+		MutableContent: true,
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	require.NotNil(t, msg.APNS)
+	require.NotNil(t, msg.APNS.Payload)
+	require.NotNil(t, msg.APNS.Payload.Aps)
+	assert.True(t, msg.APNS.Payload.Aps.MutableContent)
+}
+
+// TestSetupFCMPreservesExistingAPNS verifies the helpers merge into a
+// caller-supplied APNS struct rather than replacing it: pre-existing headers and
+// aps fields are retained while the requested capabilities are layered on top.
+func TestSetupFCMPreservesExistingAPNS(t *testing.T) {
+	req := &PushNotification{
+		Tokens:           []string{"token"},
+		ContentAvailable: true,
+		Sound:            "default",
+		APNS: &messaging.APNSConfig{
+			Headers: map[string]string{"apns-collapse-id": "abc"},
+			Payload: &messaging.APNSPayload{
+				Aps: &messaging.Aps{MutableContent: true},
+			},
+		},
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	require.NotNil(t, msg.APNS)
+	require.NotNil(t, msg.APNS.Payload)
+	require.NotNil(t, msg.APNS.Payload.Aps)
+
+	// pre-existing header retained, helper-added header present
+	assert.Equal(t, "abc", msg.APNS.Headers["apns-collapse-id"])
+	assert.Equal(t, "5", msg.APNS.Headers["apns-priority"])
+
+	// pre-existing aps field retained, helper-set fields layered onto same Aps
+	aps := msg.APNS.Payload.Aps
+	assert.True(t, aps.MutableContent)
+	assert.True(t, aps.ContentAvailable)
+	assert.Equal(t, "default", aps.Sound)
+}
