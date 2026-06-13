@@ -1,0 +1,538 @@
+package notify
+
+import (
+	"context"
+	"crypto/ecdsa"
+	"crypto/tls"
+	"encoding/base64"
+	"errors"
+	"net"
+	"net/http"
+	"path/filepath"
+	"sync"
+	"time"
+
+	"github.com/appleboy/gorush/config"
+	"github.com/appleboy/gorush/core"
+	"github.com/appleboy/gorush/logx"
+	"github.com/appleboy/gorush/status"
+
+	"github.com/mitchellh/mapstructure"
+	"github.com/sideshow/apns2"
+	"github.com/sideshow/apns2/certificate"
+	"github.com/sideshow/apns2/payload"
+	"github.com/sideshow/apns2/token"
+	"golang.org/x/net/http2"
+)
+
+var (
+	idleConnTimeout = 90 * time.Second
+	tlsDialTimeout  = 20 * time.Second
+	tcpKeepAlive    = 60 * time.Second
+)
+
+const (
+	dotP8  = ".p8"
+	dotPEM = ".pem"
+	dotP12 = ".p12"
+)
+
+var doOnce sync.Once
+
+// DialTLS is the default dial function for creating TLS connections for
+// non-proxied HTTPS requests.
+var DialTLS = func(cfg *tls.Config) func(network, addr string) (net.Conn, error) {
+	return func(network, addr string) (net.Conn, error) {
+		dialer := &net.Dialer{
+			Timeout:   tlsDialTimeout,
+			KeepAlive: tcpKeepAlive,
+		}
+		return tls.DialWithDialer(dialer, network, addr, cfg)
+	}
+}
+
+// Sound sets the aps sound on the payload.
+type Sound struct {
+	Critical int     `json:"critical,omitempty"`
+	Name     string  `json:"name,omitempty"`
+	Volume   float32 `json:"volume,omitempty"`
+}
+
+// loadCertFromFile loads certificate or auth key from a file path.
+func loadCertFromFile(
+	keyPath, password string,
+) (tls.Certificate, *ecdsa.PrivateKey, string, error) {
+	var cert tls.Certificate
+	var authKey *ecdsa.PrivateKey
+	var err error
+
+	ext := filepath.Ext(keyPath)
+	switch ext {
+	case dotP12:
+		cert, err = certificate.FromP12File(keyPath, password)
+	case dotPEM:
+		cert, err = certificate.FromPemFile(keyPath, password)
+	case dotP8:
+		authKey, err = token.AuthKeyFromFile(keyPath)
+	default:
+		err = errors.New("wrong certificate key extension")
+	}
+
+	return cert, authKey, ext, err
+}
+
+// loadCertFromBase64 loads certificate or auth key from base64 encoded data.
+func loadCertFromBase64(
+	keyBase64, keyType, password string,
+) (tls.Certificate, *ecdsa.PrivateKey, string, error) {
+	var cert tls.Certificate
+	var authKey *ecdsa.PrivateKey
+
+	ext := "." + keyType
+	key, err := base64.StdEncoding.DecodeString(keyBase64)
+	if err != nil {
+		return cert, nil, ext, err
+	}
+
+	switch ext {
+	case dotP12:
+		cert, err = certificate.FromP12Bytes(key, password)
+	case dotPEM:
+		cert, err = certificate.FromPemBytes(key, password)
+	case dotP8:
+		authKey, err = token.AuthKeyFromBytes(key)
+	default:
+		err = errors.New("wrong certificate key type")
+	}
+
+	return cert, authKey, ext, err
+}
+
+// createAPNSClientWithToken creates an APNS client using a p8 token.
+func createAPNSClientWithToken(
+	cfg *config.ConfYaml,
+	authKey *ecdsa.PrivateKey,
+) (*apns2.Client, error) {
+	if cfg.Ios.KeyID == "" || cfg.Ios.TeamID == "" {
+		return nil, errors.New("you should provide ios.KeyID and ios.TeamID for p8 token")
+	}
+	t := &token.Token{
+		AuthKey: authKey,
+		KeyID:   cfg.Ios.KeyID,
+		TeamID:  cfg.Ios.TeamID,
+	}
+	return newApnsTokenClient(cfg, t)
+}
+
+// InitAPNSClient use for initialize APNs Client.
+func InitAPNSClient(ctx context.Context, cfg *config.ConfYaml) error {
+	if !cfg.Ios.Enabled {
+		return nil
+	}
+
+	var (
+		err            error
+		authKey        *ecdsa.PrivateKey
+		certificateKey tls.Certificate
+		ext            string
+	)
+
+	switch {
+	case cfg.Ios.KeyPath != "":
+		certificateKey, authKey, ext, err = loadCertFromFile(cfg.Ios.KeyPath, cfg.Ios.Password)
+	case cfg.Ios.KeyBase64 != "":
+		certificateKey, authKey, ext, err = loadCertFromBase64(
+			cfg.Ios.KeyBase64,
+			cfg.Ios.KeyType,
+			cfg.Ios.Password,
+		)
+	}
+
+	if err != nil {
+		logx.LogError.Error("Cert Error:", err.Error())
+		return err
+	}
+
+	if ext == dotP8 {
+		ApnsClient, err = createAPNSClientWithToken(cfg, authKey)
+	} else {
+		ApnsClient, err = newApnsClient(cfg, certificateKey)
+	}
+
+	if err != nil {
+		logx.LogError.Error("Transport Error:", err.Error())
+		return err
+	}
+
+	if h2Transport, ok := ApnsClient.HTTPClient.Transport.(*http2.Transport); ok {
+		configureHTTP2ConnHealthCheck(h2Transport)
+	}
+
+	doOnce.Do(func() {
+		MaxConcurrentIOSPushes = make(chan struct{}, cfg.Ios.MaxConcurrentPushes)
+	})
+
+	return nil
+}
+
+func newApnsClient(cfg *config.ConfYaml, certificate tls.Certificate) (*apns2.Client, error) {
+	var client *apns2.Client
+
+	if cfg.Ios.Production {
+		client = apns2.NewClient(certificate).Production()
+	} else {
+		client = apns2.NewClient(certificate).Development()
+	}
+
+	if cfg.Core.HTTPProxy == "" {
+		return client, nil
+	}
+
+	//nolint:gosec // TLS min version is managed by the APNS library and proxy transport
+	tlsConfig := &tls.Config{
+		Certificates: []tls.Certificate{certificate},
+	}
+
+	if len(certificate.Certificate) > 0 {
+		//nolint:staticcheck // deprecated but required for APNS proxy certificate mapping
+		tlsConfig.BuildNameToCertificate()
+	}
+
+	transport := &http.Transport{
+		TLSClientConfig: tlsConfig,
+		DialTLS:         DialTLS(tlsConfig),
+		Proxy:           http.DefaultTransport.(*http.Transport).Proxy,
+		IdleConnTimeout: idleConnTimeout,
+	}
+
+	h2Transport, err := http2.ConfigureTransports(transport)
+	if err != nil {
+		return nil, err
+	}
+
+	configureHTTP2ConnHealthCheck(h2Transport)
+
+	client.HTTPClient.Transport = transport
+
+	return client, nil
+}
+
+func newApnsTokenClient(cfg *config.ConfYaml, token *token.Token) (*apns2.Client, error) {
+	var client *apns2.Client
+
+	if cfg.Ios.Production {
+		client = apns2.NewTokenClient(token).Production()
+	} else {
+		client = apns2.NewTokenClient(token).Development()
+	}
+
+	if cfg.Core.HTTPProxy == "" {
+		return client, nil
+	}
+
+	transport := &http.Transport{
+		DialTLS:         DialTLS(nil),
+		Proxy:           http.DefaultTransport.(*http.Transport).Proxy,
+		IdleConnTimeout: idleConnTimeout,
+	}
+
+	h2Transport, err := http2.ConfigureTransports(transport)
+	if err != nil {
+		return nil, err
+	}
+
+	configureHTTP2ConnHealthCheck(h2Transport)
+
+	client.HTTPClient.Transport = transport
+
+	return client, nil
+}
+
+func configureHTTP2ConnHealthCheck(h2Transport *http2.Transport) {
+	h2Transport.ReadIdleTimeout = 1 * time.Second
+	h2Transport.PingTimeout = 1 * time.Second
+}
+
+// setAlertTitleAndBody sets the title and body fields on the notification payload.
+func setAlertTitleAndBody(p *payload.Payload, req *PushNotification) {
+	if len(req.Title) > 0 {
+		p.AlertTitle(req.Title)
+	}
+	if len(req.Message) > 0 && len(req.Title) > 0 {
+		p.AlertBody(req.Message)
+	}
+	if len(req.Alert.Title) > 0 {
+		p.AlertTitle(req.Alert.Title)
+	}
+	if len(req.Alert.Body) > 0 {
+		p.AlertBody(req.Alert.Body)
+	}
+	// Apple Watch & Safari display this string as part of the notification interface.
+	if len(req.Alert.Subtitle) > 0 {
+		p.AlertSubtitle(req.Alert.Subtitle)
+	}
+}
+
+// setAlertLocalization sets localization-related fields on the notification payload.
+func setAlertLocalization(p *payload.Payload, req *PushNotification) {
+	if len(req.Alert.TitleLocKey) > 0 {
+		p.AlertTitleLocKey(req.Alert.TitleLocKey)
+	}
+	if len(req.Alert.TitleLocArgs) > 0 {
+		p.AlertTitleLocArgs(req.Alert.TitleLocArgs)
+	}
+	if len(req.Alert.LocKey) > 0 {
+		p.AlertLocKey(req.Alert.LocKey)
+	}
+	if len(req.Alert.LocArgs) > 0 {
+		p.AlertLocArgs(req.Alert.LocArgs)
+	}
+	if len(req.Alert.ActionLocKey) > 0 {
+		p.AlertActionLocKey(req.Alert.ActionLocKey)
+	}
+}
+
+// setAlertActions sets action and launch image fields on the notification payload.
+func setAlertActions(p *payload.Payload, req *PushNotification) {
+	if len(req.Alert.LaunchImage) > 0 {
+		p.AlertLaunchImage(req.Alert.LaunchImage)
+	}
+	if len(req.Alert.Action) > 0 {
+		p.AlertAction(req.Alert.Action)
+	}
+	if len(req.Alert.SummaryArg) > 0 {
+		p.AlertSummaryArg(req.Alert.SummaryArg)
+	}
+	if req.Alert.SummaryArgCount > 0 {
+		p.AlertSummaryArgCount(req.Alert.SummaryArgCount)
+	}
+}
+
+// setLiveActivityFields sets Live Activity related fields on the notification payload.
+func setLiveActivityFields(p *payload.Payload, req *PushNotification) {
+	if len(req.ContentState) > 0 {
+		p.SetContentState(req.ContentState)
+	}
+	if req.StaleDate > 0 {
+		p.SetStaleDate(req.StaleDate)
+	}
+	if req.DismissalDate > 0 {
+		p.SetDismissalDate(req.DismissalDate)
+	}
+	if len(req.Event) > 0 {
+		p.SetEvent(payload.ELiveActivityEvent(req.Event))
+	}
+	if req.Timestamp > 0 {
+		p.SetTimestamp(req.Timestamp)
+	}
+}
+
+func iosAlertDictionary(
+	notificationPayload *payload.Payload,
+	req *PushNotification,
+) *payload.Payload {
+	if len(req.InterruptionLevel) > 0 {
+		notificationPayload.InterruptionLevel(payload.EInterruptionLevel(req.InterruptionLevel))
+	}
+	if len(req.Category) > 0 {
+		notificationPayload.Category(req.Category)
+	}
+
+	setAlertTitleAndBody(notificationPayload, req)
+	setAlertLocalization(notificationPayload, req)
+	setAlertActions(notificationPayload, req)
+	setLiveActivityFields(notificationPayload, req)
+
+	return notificationPayload
+}
+
+// setNotificationPriority sets the priority on the notification based on the request.
+func setNotificationPriority(notification *apns2.Notification, priority string) {
+	if len(priority) == 0 {
+		return
+	}
+	switch priority {
+	case "normal":
+		notification.Priority = apns2.PriorityLow
+	case "high":
+		notification.Priority = apns2.PriorityHigh
+	}
+}
+
+// setPayloadSound sets the sound on the payload based on the request.
+func setPayloadSound(p *payload.Payload, req *PushNotification) {
+	switch req.Sound.(type) {
+	case map[string]any:
+		result := &Sound{}
+		_ = mapstructure.Decode(req.Sound, &result)
+		p.Sound(result)
+	case string:
+		p.Sound(&req.Sound)
+	case Sound:
+		p.Sound(&req.Sound)
+	}
+	if len(req.SoundName) > 0 {
+		p.SoundName(req.SoundName)
+	}
+	if req.SoundVolume > 0 {
+		p.SoundVolume(req.SoundVolume)
+	}
+}
+
+// buildIOSPayload constructs the payload for an iOS notification.
+func buildIOSPayload(req *PushNotification) *payload.Payload {
+	p := payload.NewPayload()
+
+	// add alert object if message length > 0 and title is empty
+	if len(req.Message) > 0 && req.Title == "" {
+		p.Alert(req.Message)
+	}
+
+	// zero value for clear the badge on the app icon.
+	if req.Badge != nil && *req.Badge >= 0 {
+		p.Badge(*req.Badge)
+	}
+
+	if req.MutableContent {
+		p.MutableContent()
+	}
+
+	setPayloadSound(p, req)
+
+	if req.ContentAvailable {
+		p.ContentAvailable()
+	}
+
+	if len(req.URLArgs) > 0 {
+		p.URLArgs(req.URLArgs)
+	}
+
+	if len(req.ThreadID) > 0 {
+		p.ThreadID(req.ThreadID)
+	}
+
+	for k, v := range req.Data {
+		p.Custom(k, v)
+	}
+
+	return iosAlertDictionary(p, req)
+}
+
+// GetIOSNotification use for define iOS notification.
+// The iOS Notification Payload (Payload Key Reference)
+// Ref: https://apple.co/2VtH6Iu
+func GetIOSNotification(req *PushNotification) *apns2.Notification {
+	notification := &apns2.Notification{
+		ApnsID:     req.ApnsID,
+		Topic:      req.Topic,
+		CollapseID: req.CollapseID,
+	}
+
+	if req.Expiration != nil {
+		notification.Expiration = time.Unix(*req.Expiration, 0)
+	}
+
+	setNotificationPriority(notification, req.Priority)
+
+	if len(req.PushType) > 0 {
+		notification.PushType = apns2.EPushType(req.PushType)
+	}
+
+	notification.Payload = buildIOSPayload(req)
+
+	return notification
+}
+
+func getApnsClient(cfg *config.ConfYaml, req *PushNotification) (client *apns2.Client) {
+	switch {
+	case req.Production:
+		client = ApnsClient.Production()
+	case req.Development:
+		client = ApnsClient.Development()
+	default:
+		if cfg.Ios.Production {
+			client = ApnsClient.Production()
+		} else {
+			client = ApnsClient.Development()
+		}
+	}
+	return client
+}
+
+// PushToIOS provide send notification to APNs server.
+func PushToIOS(
+	ctx context.Context,
+	req *PushNotification,
+	cfg *config.ConfYaml,
+) (resp *ResponsePush, err error) {
+	logx.LogAccess.Debug("Start push notification for iOS")
+
+	var (
+		retryCount = 0
+		maxRetry   = cfg.Ios.MaxRetry
+	)
+
+	if req.Retry > 0 && req.Retry < maxRetry {
+		maxRetry = req.Retry
+	}
+
+	resp = &ResponsePush{}
+
+Retry:
+	var newTokens []string
+
+	notification := GetIOSNotification(req)
+	client := getApnsClient(cfg, req)
+
+	var wg sync.WaitGroup
+	for _, token := range req.Tokens {
+		// occupy push slot
+		MaxConcurrentIOSPushes <- struct{}{}
+		wg.Add(1)
+		go func(notification apns2.Notification, token string) {
+			notification.DeviceToken = token
+
+			// send ios notification
+			res, err := client.PushWithContext(ctx, &notification)
+			if err != nil || (res != nil && res.StatusCode != http.StatusOK) {
+				if err == nil {
+					// error message:
+					// ref: https://github.com/sideshow/apns2/blob/master/response.go#L14-L65
+					err = errors.New(res.Reason)
+				}
+
+				// apns server error
+				errLog := logPush(cfg, core.FailedPush, token, req, err)
+				resp.Logs = append(resp.Logs, errLog)
+
+				status.StatStorage.AddIosError(1)
+				// We should retry only "retryable" statuses. More info about response:
+				// See https://apple.co/3AdNane (Handling Notification Responses from APNs)
+				if res != nil && res.StatusCode >= http.StatusInternalServerError {
+					newTokens = append(newTokens, token)
+				}
+			}
+
+			if res != nil && res.Sent() {
+				logPush(cfg, core.SucceededPush, token, req, nil)
+				status.StatStorage.AddIosSuccess(1)
+			}
+
+			// free push slot
+			<-MaxConcurrentIOSPushes
+			wg.Done()
+		}(*notification, token)
+	}
+
+	wg.Wait()
+
+	if len(newTokens) > 0 && retryCount < maxRetry {
+		retryCount++
+
+		// resend fail token
+		req.Tokens = newTokens
+		goto Retry
+	}
+
+	return resp, nil
+}
