@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -427,32 +428,313 @@ func ValidatePIDPath(pidPath string) error {
 	return nil
 }
 
+// ValidateHostPort validates a string in host:port format.
+func ValidateHostPort(addr string) error {
+	if addr == "" {
+		return fmt.Errorf("address must not be empty")
+	}
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid host:port format %q: %w", addr, err)
+	}
+	if host == "" {
+		return fmt.Errorf("host must not be empty in %q", addr)
+	}
+	if err := ValidateAddress(host); err != nil {
+		return fmt.Errorf("invalid host: %w", err)
+	}
+	if err := ValidatePort(port); err != nil {
+		return fmt.Errorf("invalid port: %w", err)
+	}
+	return nil
+}
+
+// ValidateURL validates that a string is a well-formed URL with http or https scheme.
+func ValidateURL(rawURL string) error {
+	if rawURL == "" {
+		return nil
+	}
+	u, err := url.Parse(rawURL)
+	if err != nil {
+		return fmt.Errorf("invalid URL %q: %w", rawURL, err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf("URL scheme must be http or https, got %q", u.Scheme)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("URL must have a host: %q", rawURL)
+	}
+	return nil
+}
+
+// validLogLevels is the set of log levels accepted by the logging subsystem.
+var validLogLevels = map[string]bool{
+	"trace":   true,
+	"debug":   true,
+	"info":    true,
+	"warn":    true,
+	"error":   true,
+	"fatal":   true,
+	"panic":   true,
+	"disable": true,
+}
+
+// ValidateLogLevel validates that the given string is a recognized log level.
+func ValidateLogLevel(level string) error {
+	if level == "" {
+		return nil // empty is allowed, defaults will apply
+	}
+	if !validLogLevels[strings.ToLower(level)] {
+		return fmt.Errorf("invalid log level %q", level)
+	}
+	return nil
+}
+
+// validStatEngines enumerates the supported stat storage backends.
+var validStatEngines = map[string]bool{
+	"memory":  true,
+	"redis":   true,
+	"boltdb":  true,
+	"buntdb":  true,
+	"leveldb": true,
+	"badger":  true,
+}
+
+// ValidateStatEngine validates the stat storage engine name and its backend-specific config.
+func ValidateStatEngine(engine string, stat SectionStat) error {
+	if engine == "" {
+		return fmt.Errorf("stat engine must not be empty")
+	}
+	if !validStatEngines[engine] {
+		return fmt.Errorf("unsupported stat engine %q (valid: memory, redis, boltdb, buntdb, leveldb, badger)", engine)
+	}
+	switch engine {
+	case "redis":
+		if stat.Redis.Addr == "" {
+			return fmt.Errorf("stat redis addr must not be empty")
+		}
+		if err := ValidateHostPort(stat.Redis.Addr); err != nil {
+			return fmt.Errorf("stat redis address: %w", err)
+		}
+	case "boltdb":
+		if stat.BoltDB.Path == "" {
+			return fmt.Errorf("stat boltdb path must not be empty")
+		}
+		if stat.BoltDB.Bucket == "" {
+			return fmt.Errorf("stat boltdb bucket must not be empty")
+		}
+	case "buntdb":
+		if stat.BuntDB.Path == "" {
+			return fmt.Errorf("stat buntdb path must not be empty")
+		}
+	case "leveldb":
+		if stat.LevelDB.Path == "" {
+			return fmt.Errorf("stat leveldb path must not be empty")
+		}
+	case "badger":
+		if stat.BadgerDB.Path == "" {
+			return fmt.Errorf("stat badgerdb path must not be empty")
+		}
+	}
+	return nil
+}
+
+// validQueueEngines enumerates the supported queue backends.
+var validQueueEngines = map[string]bool{
+	"local": true,
+	"nsq":   true,
+	"nats":  true,
+	"redis": true,
+}
+
+// ValidateQueueEngine validates the queue engine name and its backend-specific config.
+func ValidateQueueEngine(engine string, q SectionQueue) error {
+	if engine == "" {
+		return fmt.Errorf("queue engine must not be empty")
+	}
+	if !validQueueEngines[engine] {
+		return fmt.Errorf("unsupported queue engine %q (valid: local, nsq, nats, redis)", engine)
+	}
+	switch engine {
+	case "nsq":
+		if q.NSQ.Addr == "" {
+			return fmt.Errorf("queue nsq addr must not be empty")
+		}
+		if err := ValidateHostPort(q.NSQ.Addr); err != nil {
+			return fmt.Errorf("queue nsq address: %w", err)
+		}
+		if q.NSQ.Topic == "" {
+			return fmt.Errorf("queue nsq topic must not be empty")
+		}
+		if q.NSQ.Channel == "" {
+			return fmt.Errorf("queue nsq channel must not be empty")
+		}
+	case "nats":
+		if q.NATS.Addr == "" {
+			return fmt.Errorf("queue nats addr must not be empty")
+		}
+		if err := ValidateHostPort(q.NATS.Addr); err != nil {
+			return fmt.Errorf("queue nats address: %w", err)
+		}
+		if q.NATS.Subj == "" {
+			return fmt.Errorf("queue nats subject must not be empty")
+		}
+		if q.NATS.Queue == "" {
+			return fmt.Errorf("queue nats queue must not be empty")
+		}
+	case "redis":
+		if q.Redis.Addr == "" {
+			return fmt.Errorf("queue redis addr must not be empty")
+		}
+		if err := ValidateHostPort(q.Redis.Addr); err != nil {
+			return fmt.Errorf("queue redis address: %w", err)
+		}
+		if q.Redis.StreamName == "" {
+			return fmt.Errorf("queue redis stream_name must not be empty")
+		}
+		if q.Redis.Group == "" {
+			return fmt.Errorf("queue redis group must not be empty")
+		}
+		if q.Redis.Consumer == "" {
+			return fmt.Errorf("queue redis consumer must not be empty")
+		}
+	}
+	return nil
+}
+
+// ValidateTLSConfig validates the SSL/AutoTLS configuration combinations.
+// When SSL is enabled, either file-based certs or base64-encoded certs must be provided.
+// AutoTLS requires a non-empty host.
+func ValidateTLSConfig(core SectionCore) error {
+	if core.AutoTLS.Enabled {
+		if core.AutoTLS.Host == "" {
+			return fmt.Errorf("auto_tls host must not be empty when auto_tls is enabled")
+		}
+		if core.AutoTLS.Folder == "" {
+			return fmt.Errorf("auto_tls folder must not be empty when auto_tls is enabled")
+		}
+	}
+
+	if core.SSL && !core.AutoTLS.Enabled {
+		// Check for partial file cert config first (more specific error)
+		if (core.CertPath != "") != (core.KeyPath != "") {
+			return fmt.Errorf("SSL cert_path and key_path must both be set or both be empty")
+		}
+		// Check for partial base64 cert config
+		if (core.CertBase64 != "") != (core.KeyBase64 != "") {
+			return fmt.Errorf("SSL cert_base64 and key_base64 must both be set or both be empty")
+		}
+
+		hasFileCert := core.CertPath != "" && core.KeyPath != ""
+		hasBase64Cert := core.CertBase64 != "" && core.KeyBase64 != ""
+
+		if !hasFileCert && !hasBase64Cert {
+			return fmt.Errorf("SSL is enabled but no certificate configured: provide cert_path+key_path or cert_base64+key_base64")
+		}
+	}
+
+	return nil
+}
+
+// ValidateGRPC validates the gRPC section: port must be valid when enabled.
+func ValidateGRPC(grpc SectionGRPC) error {
+	if grpc.Enabled {
+		if grpc.Port == "" {
+			return fmt.Errorf("grpc port must not be empty when grpc is enabled")
+		}
+		if err := ValidatePort(grpc.Port); err != nil {
+			return fmt.Errorf("invalid grpc port: %w", err)
+		}
+	}
+	return nil
+}
+
+// validModes enumerates the accepted core mode values.
+var validModes = map[string]bool{
+	"debug":   true,
+	"release": true,
+	"test":    true,
+}
+
 // ValidateConfig validates critical configuration parameters
 func ValidateConfig(cfg *ConfYaml) error {
+	// Core port and address
 	if err := ValidatePort(cfg.Core.Port); err != nil {
 		return fmt.Errorf("invalid core port: %w", err)
 	}
-
 	if err := ValidateAddress(cfg.Core.Address); err != nil {
 		return fmt.Errorf("invalid core address: %w", err)
 	}
 
+	// PID path
 	if err := ValidatePIDPath(cfg.Core.PID.Path); err != nil {
 		return fmt.Errorf("invalid PID path: %w", err)
 	}
 
-	// Validate Redis address if Redis is enabled
-	if cfg.Stat.Engine == "redis" && cfg.Stat.Redis.Addr != "" {
-		host, port, err := net.SplitHostPort(cfg.Stat.Redis.Addr)
-		if err != nil {
-			return fmt.Errorf("invalid Redis address format: %s", cfg.Stat.Redis.Addr)
+	// Core mode
+	if cfg.Core.Mode != "" && !validModes[cfg.Core.Mode] {
+		return fmt.Errorf("invalid core mode %q (valid: debug, release, test)", cfg.Core.Mode)
+	}
+
+	// Worker and queue limits
+	if cfg.Core.WorkerNum < 0 {
+		return fmt.Errorf("core worker_num must be non-negative, got %d", cfg.Core.WorkerNum)
+	}
+	if cfg.Core.QueueNum < 0 {
+		return fmt.Errorf("core queue_num must be non-negative, got %d", cfg.Core.QueueNum)
+	}
+	if cfg.Core.MaxNotification < 0 {
+		return fmt.Errorf("core max_notification must be non-negative, got %d", cfg.Core.MaxNotification)
+	}
+
+	// Log levels
+	if err := ValidateLogLevel(cfg.Log.AccessLevel); err != nil {
+		return fmt.Errorf("invalid log access_level: %w", err)
+	}
+	if err := ValidateLogLevel(cfg.Log.ErrorLevel); err != nil {
+		return fmt.Errorf("invalid log error_level: %w", err)
+	}
+
+	// HTTP proxy
+	if cfg.Core.HTTPProxy != "" {
+		if err := ValidateURL(cfg.Core.HTTPProxy); err != nil {
+			return fmt.Errorf("invalid http_proxy: %w", err)
 		}
-		if err := ValidateAddress(host); err != nil {
-			return fmt.Errorf("invalid Redis host: %w", err)
+	}
+
+	// Feedback hook URL
+	if cfg.Core.FeedbackURL != "" {
+		if err := ValidateURL(cfg.Core.FeedbackURL); err != nil {
+			return fmt.Errorf("invalid feedback_hook_url: %w", err)
 		}
-		if err := ValidatePort(port); err != nil {
-			return fmt.Errorf("invalid Redis port: %w", err)
+		if cfg.Core.FeedbackTimeout <= 0 {
+			return fmt.Errorf("feedback_timeout must be positive when feedback_hook_url is set, got %d", cfg.Core.FeedbackTimeout)
 		}
+	}
+
+	// TLS / AutoTLS
+	if err := ValidateTLSConfig(cfg.Core); err != nil {
+		return err
+	}
+
+	// Stat engine
+	if err := ValidateStatEngine(cfg.Stat.Engine, cfg.Stat); err != nil {
+		return fmt.Errorf("stat engine validation failed: %w", err)
+	}
+
+	// Queue engine
+	if err := ValidateQueueEngine(cfg.Queue.Engine, cfg.Queue); err != nil {
+		return fmt.Errorf("queue engine validation failed: %w", err)
+	}
+
+	// gRPC
+	if err := ValidateGRPC(cfg.GRPC); err != nil {
+		return err
+	}
+
+	// Port conflict between HTTP and gRPC
+	if cfg.GRPC.Enabled && cfg.Core.Enabled && cfg.GRPC.Port == cfg.Core.Port {
+		return fmt.Errorf("HTTP port and gRPC port must not be the same (%s)", cfg.Core.Port)
 	}
 
 	return nil

@@ -522,12 +522,19 @@ func TestValidateConfig(t *testing.T) {
 			name: "valid config",
 			cfg: &ConfYaml{
 				Core: SectionCore{
-					Port:    "8088",
-					Address: "0.0.0.0",
+					Port:            "8088",
+					Address:         "0.0.0.0",
+					Mode:            "release",
+					WorkerNum:       4,
+					QueueNum:        8192,
+					MaxNotification: 100,
 				},
-				Stat: SectionStat{
-					Engine: "memory",
+				Log: SectionLog{
+					AccessLevel: "debug",
+					ErrorLevel:  "error",
 				},
+				Stat:  SectionStat{Engine: "memory"},
+				Queue: SectionQueue{Engine: "local"},
 			},
 			wantErr: false,
 		},
@@ -776,4 +783,868 @@ func TestSanitizedCopyEmptyFields(t *testing.T) {
 	assert.Empty(t, sanitized.Queue.Redis.Password)
 	assert.Empty(t, sanitized.Stat.Redis.Username)
 	assert.Empty(t, sanitized.Stat.Redis.Password)
+}
+
+// ---------- new validation tests ----------
+
+func TestValidateHostPort(t *testing.T) {
+	tests := []struct {
+		name    string
+		addr    string
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "empty", addr: "", wantErr: true, errMsg: "must not be empty"},
+		{name: "valid ip:port", addr: "127.0.0.1:6379", wantErr: false},
+		{name: "valid host:port", addr: "localhost:4150", wantErr: false},
+		{name: "valid high port", addr: "0.0.0.0:65535", wantErr: false},
+		{name: "missing port", addr: "127.0.0.1", wantErr: true, errMsg: "invalid host:port"},
+		{name: "invalid port", addr: "127.0.0.1:abc", wantErr: true, errMsg: "invalid port"},
+		{name: "port out of range", addr: "127.0.0.1:99999", wantErr: true, errMsg: "invalid port"},
+		{name: "just colon", addr: ":", wantErr: true, errMsg: "host must not be empty"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateHostPort(tt.addr)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateURL(t *testing.T) {
+	tests := []struct {
+		name    string
+		raw     string
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "empty is valid", raw: "", wantErr: false},
+		{name: "valid http", raw: "http://example.com/hook", wantErr: false},
+		{name: "valid https", raw: "https://example.com/hook", wantErr: false},
+		{name: "valid with port", raw: "http://localhost:8080/callback", wantErr: false},
+		{name: "ftp scheme", raw: "ftp://example.com", wantErr: true, errMsg: "http or https"},
+		{name: "no scheme", raw: "example.com", wantErr: true, errMsg: "http or https"},
+		{name: "no host", raw: "http://", wantErr: true, errMsg: "must have a host"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateURL(tt.raw)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateLogLevel(t *testing.T) {
+	tests := []struct {
+		name    string
+		level   string
+		wantErr bool
+	}{
+		{name: "empty is valid", level: "", wantErr: false},
+		{name: "debug", level: "debug", wantErr: false},
+		{name: "info", level: "info", wantErr: false},
+		{name: "warn", level: "warn", wantErr: false},
+		{name: "error", level: "error", wantErr: false},
+		{name: "fatal", level: "fatal", wantErr: false},
+		{name: "trace", level: "trace", wantErr: false},
+		{name: "panic", level: "panic", wantErr: false},
+		{name: "disable", level: "disable", wantErr: false},
+		{name: "case insensitive", level: "DEBUG", wantErr: false},
+		{name: "invalid", level: "verbose", wantErr: true},
+		{name: "garbage", level: "not-a-level", wantErr: true},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateLogLevel(tt.level)
+			if tt.wantErr {
+				require.Error(t, err)
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateStatEngine(t *testing.T) {
+	tests := []struct {
+		name    string
+		engine  string
+		stat    SectionStat
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "memory valid",
+			engine:  "memory",
+			stat:    SectionStat{},
+			wantErr: false,
+		},
+		{
+			name:    "empty engine",
+			engine:  "",
+			wantErr: true,
+			errMsg:  "must not be empty",
+		},
+		{
+			name:    "unsupported engine",
+			engine:  "mongodb",
+			wantErr: true,
+			errMsg:  "unsupported stat engine",
+		},
+		{
+			name:   "redis valid",
+			engine: "redis",
+			stat: SectionStat{
+				Redis: SectionRedis{Addr: "localhost:6379"},
+			},
+			wantErr: false,
+		},
+		{
+			name:    "redis empty addr",
+			engine:  "redis",
+			stat:    SectionStat{Redis: SectionRedis{Addr: ""}},
+			wantErr: true,
+			errMsg:  "redis addr",
+		},
+		{
+			name:    "redis invalid addr",
+			engine:  "redis",
+			stat:    SectionStat{Redis: SectionRedis{Addr: "no-port"}},
+			wantErr: true,
+			errMsg:  "redis address",
+		},
+		{
+			name:   "boltdb valid",
+			engine: "boltdb",
+			stat: SectionStat{
+				BoltDB: SectionBoltDB{Path: "bolt.db", Bucket: "gorush"},
+			},
+			wantErr: false,
+		},
+		{
+			name:    "boltdb empty path",
+			engine:  "boltdb",
+			stat:    SectionStat{BoltDB: SectionBoltDB{Path: "", Bucket: "gorush"}},
+			wantErr: true,
+			errMsg:  "boltdb path",
+		},
+		{
+			name:    "boltdb empty bucket",
+			engine:  "boltdb",
+			stat:    SectionStat{BoltDB: SectionBoltDB{Path: "bolt.db", Bucket: ""}},
+			wantErr: true,
+			errMsg:  "boltdb bucket",
+		},
+		{
+			name:    "buntdb valid",
+			engine:  "buntdb",
+			stat:    SectionStat{BuntDB: SectionBuntDB{Path: "bunt.db"}},
+			wantErr: false,
+		},
+		{
+			name:    "buntdb empty path",
+			engine:  "buntdb",
+			stat:    SectionStat{BuntDB: SectionBuntDB{Path: ""}},
+			wantErr: true,
+			errMsg:  "buntdb path",
+		},
+		{
+			name:    "leveldb valid",
+			engine:  "leveldb",
+			stat:    SectionStat{LevelDB: SectionLevelDB{Path: "level.db"}},
+			wantErr: false,
+		},
+		{
+			name:    "leveldb empty path",
+			engine:  "leveldb",
+			stat:    SectionStat{LevelDB: SectionLevelDB{Path: ""}},
+			wantErr: true,
+			errMsg:  "leveldb path",
+		},
+		{
+			name:    "badger valid",
+			engine:  "badger",
+			stat:    SectionStat{BadgerDB: SectionBadgerDB{Path: "badger.db"}},
+			wantErr: false,
+		},
+		{
+			name:    "badger empty path",
+			engine:  "badger",
+			stat:    SectionStat{BadgerDB: SectionBadgerDB{Path: ""}},
+			wantErr: true,
+			errMsg:  "badgerdb path",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateStatEngine(tt.engine, tt.stat)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateQueueEngine(t *testing.T) {
+	tests := []struct {
+		name    string
+		engine  string
+		q       SectionQueue
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "local valid",
+			engine:  "local",
+			q:       SectionQueue{},
+			wantErr: false,
+		},
+		{
+			name:    "empty engine",
+			engine:  "",
+			wantErr: true,
+			errMsg:  "must not be empty",
+		},
+		{
+			name:    "unsupported engine",
+			engine:  "kafka",
+			wantErr: true,
+			errMsg:  "unsupported queue engine",
+		},
+		{
+			name:   "nsq valid",
+			engine: "nsq",
+			q: SectionQueue{
+				NSQ: SectionNSQ{Addr: "127.0.0.1:4150", Topic: "gorush", Channel: "gorush"},
+			},
+			wantErr: false,
+		},
+		{
+			name:    "nsq empty addr",
+			engine:  "nsq",
+			q:       SectionQueue{NSQ: SectionNSQ{Addr: "", Topic: "t", Channel: "c"}},
+			wantErr: true,
+			errMsg:  "nsq addr",
+		},
+		{
+			name:    "nsq invalid addr",
+			engine:  "nsq",
+			q:       SectionQueue{NSQ: SectionNSQ{Addr: "bad", Topic: "t", Channel: "c"}},
+			wantErr: true,
+			errMsg:  "nsq address",
+		},
+		{
+			name:    "nsq empty topic",
+			engine:  "nsq",
+			q:       SectionQueue{NSQ: SectionNSQ{Addr: "127.0.0.1:4150", Topic: "", Channel: "c"}},
+			wantErr: true,
+			errMsg:  "nsq topic",
+		},
+		{
+			name:    "nsq empty channel",
+			engine:  "nsq",
+			q:       SectionQueue{NSQ: SectionNSQ{Addr: "127.0.0.1:4150", Topic: "t", Channel: ""}},
+			wantErr: true,
+			errMsg:  "nsq channel",
+		},
+		{
+			name:   "nats valid",
+			engine: "nats",
+			q: SectionQueue{
+				NATS: SectionNATS{Addr: "127.0.0.1:4222", Subj: "gorush", Queue: "gorush"},
+			},
+			wantErr: false,
+		},
+		{
+			name:    "nats empty addr",
+			engine:  "nats",
+			q:       SectionQueue{NATS: SectionNATS{Addr: "", Subj: "s", Queue: "q"}},
+			wantErr: true,
+			errMsg:  "nats addr",
+		},
+		{
+			name:    "nats invalid addr",
+			engine:  "nats",
+			q:       SectionQueue{NATS: SectionNATS{Addr: "bad", Subj: "s", Queue: "q"}},
+			wantErr: true,
+			errMsg:  "nats address",
+		},
+		{
+			name:    "nats empty subject",
+			engine:  "nats",
+			q:       SectionQueue{NATS: SectionNATS{Addr: "127.0.0.1:4222", Subj: "", Queue: "q"}},
+			wantErr: true,
+			errMsg:  "nats subject",
+		},
+		{
+			name:    "nats empty queue",
+			engine:  "nats",
+			q:       SectionQueue{NATS: SectionNATS{Addr: "127.0.0.1:4222", Subj: "s", Queue: ""}},
+			wantErr: true,
+			errMsg:  "nats queue",
+		},
+		{
+			name:   "redis valid",
+			engine: "redis",
+			q: SectionQueue{
+				Redis: SectionRedisQueue{
+					Addr: "127.0.0.1:6379", StreamName: "gorush",
+					Group: "gorush", Consumer: "gorush",
+				},
+			},
+			wantErr: false,
+		},
+		{
+			name:    "redis empty addr",
+			engine:  "redis",
+			q:       SectionQueue{Redis: SectionRedisQueue{Addr: "", StreamName: "s", Group: "g", Consumer: "c"}},
+			wantErr: true,
+			errMsg:  "redis addr",
+		},
+		{
+			name:    "redis invalid addr",
+			engine:  "redis",
+			q:       SectionQueue{Redis: SectionRedisQueue{Addr: "bad", StreamName: "s", Group: "g", Consumer: "c"}},
+			wantErr: true,
+			errMsg:  "redis address",
+		},
+		{
+			name:    "redis empty stream",
+			engine:  "redis",
+			q:       SectionQueue{Redis: SectionRedisQueue{Addr: "127.0.0.1:6379", StreamName: "", Group: "g", Consumer: "c"}},
+			wantErr: true,
+			errMsg:  "stream_name",
+		},
+		{
+			name:    "redis empty group",
+			engine:  "redis",
+			q:       SectionQueue{Redis: SectionRedisQueue{Addr: "127.0.0.1:6379", StreamName: "s", Group: "", Consumer: "c"}},
+			wantErr: true,
+			errMsg:  "group",
+		},
+		{
+			name:    "redis empty consumer",
+			engine:  "redis",
+			q:       SectionQueue{Redis: SectionRedisQueue{Addr: "127.0.0.1:6379", StreamName: "s", Group: "g", Consumer: ""}},
+			wantErr: true,
+			errMsg:  "consumer",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateQueueEngine(tt.engine, tt.q)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateTLSConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		core    SectionCore
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "no SSL no AutoTLS",
+			core:    SectionCore{},
+			wantErr: false,
+		},
+		{
+			name: "SSL with file certs",
+			core: SectionCore{
+				SSL: true, CertPath: "cert.pem", KeyPath: "key.pem",
+			},
+			wantErr: false,
+		},
+		{
+			name: "SSL with base64 certs",
+			core: SectionCore{
+				SSL: true, CertBase64: "Y2VydA==", KeyBase64: "a2V5",
+			},
+			wantErr: false,
+		},
+		{
+			name:    "SSL enabled but no certs",
+			core:    SectionCore{SSL: true},
+			wantErr: true,
+			errMsg:  "no certificate configured",
+		},
+		{
+			name: "SSL with only cert_path",
+			core: SectionCore{
+				SSL: true, CertPath: "cert.pem",
+			},
+			wantErr: true,
+			errMsg:  "cert_path and key_path must both be set",
+		},
+		{
+			name: "SSL with only key_path",
+			core: SectionCore{
+				SSL: true, KeyPath: "key.pem",
+			},
+			wantErr: true,
+			errMsg:  "cert_path and key_path must both be set",
+		},
+		{
+			name: "SSL with only cert_base64",
+			core: SectionCore{
+				SSL: true, CertBase64: "Y2VydA==",
+			},
+			wantErr: true,
+			errMsg:  "cert_base64 and key_base64 must both be set",
+		},
+		{
+			name: "SSL with only key_base64",
+			core: SectionCore{
+				SSL: true, KeyBase64: "a2V5",
+			},
+			wantErr: true,
+			errMsg:  "cert_base64 and key_base64 must both be set",
+		},
+		{
+			name: "AutoTLS valid",
+			core: SectionCore{
+				AutoTLS: SectionAutoTLS{Enabled: true, Host: "example.com", Folder: ".cache"},
+			},
+			wantErr: false,
+		},
+		{
+			name: "AutoTLS empty host",
+			core: SectionCore{
+				AutoTLS: SectionAutoTLS{Enabled: true, Host: "", Folder: ".cache"},
+			},
+			wantErr: true,
+			errMsg:  "auto_tls host",
+		},
+		{
+			name: "AutoTLS empty folder",
+			core: SectionCore{
+				AutoTLS: SectionAutoTLS{Enabled: true, Host: "example.com", Folder: ""},
+			},
+			wantErr: true,
+			errMsg:  "auto_tls folder",
+		},
+		{
+			name: "SSL with AutoTLS enabled skips cert check",
+			core: SectionCore{
+				SSL:     true,
+				AutoTLS: SectionAutoTLS{Enabled: true, Host: "example.com", Folder: ".cache"},
+			},
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateTLSConfig(tt.core)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+func TestValidateGRPC(t *testing.T) {
+	tests := []struct {
+		name    string
+		grpc    SectionGRPC
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "disabled no port",
+			grpc:    SectionGRPC{Enabled: false},
+			wantErr: false,
+		},
+		{
+			name:    "enabled valid port",
+			grpc:    SectionGRPC{Enabled: true, Port: "9000"},
+			wantErr: false,
+		},
+		{
+			name:    "enabled empty port",
+			grpc:    SectionGRPC{Enabled: true, Port: ""},
+			wantErr: true,
+			errMsg:  "must not be empty",
+		},
+		{
+			name:    "enabled invalid port",
+			grpc:    SectionGRPC{Enabled: true, Port: "abc"},
+			wantErr: true,
+			errMsg:  "invalid grpc port",
+		},
+		{
+			name:    "enabled port out of range",
+			grpc:    SectionGRPC{Enabled: true, Port: "99999"},
+			wantErr: true,
+			errMsg:  "invalid grpc port",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateGRPC(tt.grpc)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// validMinimalConfig returns a minimal valid ConfYaml for testing.
+func validMinimalConfig() *ConfYaml {
+	return &ConfYaml{
+		Core: SectionCore{
+			Port:            "8088",
+			Mode:            "release",
+			WorkerNum:       4,
+			QueueNum:        8192,
+			MaxNotification: 100,
+		},
+		Log: SectionLog{
+			AccessLevel: "debug",
+			ErrorLevel:  "error",
+		},
+		Stat:  SectionStat{Engine: "memory"},
+		Queue: SectionQueue{Engine: "local"},
+	}
+}
+
+func TestValidateConfigComprehensive(t *testing.T) {
+	tests := []struct {
+		name    string
+		cfg     *ConfYaml
+		wantErr bool
+		errMsg  string
+	}{
+		{
+			name:    "valid minimal config",
+			cfg:     validMinimalConfig(),
+			wantErr: false,
+		},
+		{
+			name: "invalid core port",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.Port = "99999"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "invalid core port",
+		},
+		{
+			name: "invalid mode",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.Mode = "production"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "invalid core mode",
+		},
+		{
+			name: "negative worker_num",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.WorkerNum = -1
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "worker_num must be non-negative",
+		},
+		{
+			name: "negative queue_num",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.QueueNum = -1
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "queue_num must be non-negative",
+		},
+		{
+			name: "negative max_notification",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.MaxNotification = -1
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "max_notification must be non-negative",
+		},
+		{
+			name: "invalid log access_level",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Log.AccessLevel = "verbose"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "invalid log access_level",
+		},
+		{
+			name: "invalid log error_level",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Log.ErrorLevel = "nope"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "invalid log error_level",
+		},
+		{
+			name: "invalid http proxy",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.HTTPProxy = "ftp://bad-scheme"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "invalid http_proxy",
+		},
+		{
+			name: "valid http proxy",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.HTTPProxy = "http://proxy:8080"
+				return c
+			}(),
+			wantErr: false,
+		},
+		{
+			name: "invalid feedback URL",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.FeedbackURL = "ftp://invalid"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "invalid feedback_hook_url",
+		},
+		{
+			name: "valid feedback URL",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.FeedbackURL = "https://hooks.example.com/feedback"
+				c.Core.FeedbackTimeout = 10
+				return c
+			}(),
+			wantErr: false,
+		},
+		{
+			name: "feedback URL with zero timeout",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.FeedbackURL = "https://hooks.example.com/feedback"
+				c.Core.FeedbackTimeout = 0
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "feedback_timeout must be positive",
+		},
+		{
+			name: "invalid stat engine",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Stat.Engine = "mongodb"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "stat engine",
+		},
+		{
+			name: "invalid queue engine",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Queue.Engine = "kafka"
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "queue engine",
+		},
+		{
+			name: "grpc enabled invalid port",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.GRPC = SectionGRPC{Enabled: true, Port: "bad"}
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "invalid grpc port",
+		},
+		{
+			name: "grpc enabled valid",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.GRPC = SectionGRPC{Enabled: true, Port: "9000"}
+				return c
+			}(),
+			wantErr: false,
+		},
+		{
+			name: "port conflict HTTP and gRPC",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.Port = "9000"
+				c.Core.Enabled = true
+				c.GRPC = SectionGRPC{Enabled: true, Port: "9000"}
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "must not be the same",
+		},
+		{
+			name: "SSL without certs",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.SSL = true
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "no certificate configured",
+		},
+		{
+			name: "SSL with certs valid",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.SSL = true
+				c.Core.CertPath = "cert.pem"
+				c.Core.KeyPath = "key.pem"
+				return c
+			}(),
+			wantErr: false,
+		},
+		{
+			name: "AutoTLS empty host",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Core.AutoTLS = SectionAutoTLS{Enabled: true, Folder: ".cache"}
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "auto_tls host",
+		},
+		{
+			name: "queue nsq invalid addr",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Queue.Engine = "nsq"
+				c.Queue.NSQ = SectionNSQ{Addr: "bad", Topic: "t", Channel: "c"}
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "queue engine",
+		},
+		{
+			name: "queue redis valid",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Queue.Engine = "redis"
+				c.Queue.Redis = SectionRedisQueue{
+					Addr: "127.0.0.1:6379", StreamName: "gorush",
+					Group: "gorush", Consumer: "gorush",
+				}
+				return c
+			}(),
+			wantErr: false,
+		},
+		{
+			name: "stat redis invalid addr",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Stat.Engine = "redis"
+				c.Stat.Redis = SectionRedis{Addr: "no-port"}
+				return c
+			}(),
+			wantErr: true,
+			errMsg:  "stat engine",
+		},
+		{
+			name: "stat boltdb valid",
+			cfg: func() *ConfYaml {
+				c := validMinimalConfig()
+				c.Stat.Engine = "boltdb"
+				c.Stat.BoltDB = SectionBoltDB{Path: "bolt.db", Bucket: "gorush"}
+				return c
+			}(),
+			wantErr: false,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			err := ValidateConfig(tt.cfg)
+			if tt.wantErr {
+				require.Error(t, err)
+				if tt.errMsg != "" {
+					assert.Contains(t, err.Error(), tt.errMsg)
+				}
+			} else {
+				require.NoError(t, err)
+			}
+		})
+	}
+}
+
+// TestValidateConfigWithDefaultConfig verifies the default config passes validation.
+func TestValidateConfigWithDefaultConfig(t *testing.T) {
+	cfg, err := LoadConf()
+	require.NoError(t, err)
+	require.NoError(t, ValidateConfig(cfg))
+}
+
+// TestValidateConfigWithTestdataConfig verifies the testdata config passes validation.
+func TestValidateConfigWithTestdataConfig(t *testing.T) {
+	cfg, err := LoadConf("testdata/config.yml")
+	require.NoError(t, err)
+	require.NoError(t, ValidateConfig(cfg))
+}
+
+// TestValidateConfigWithRedisDBConfig verifies the redis_db_config testdata passes validation.
+func TestValidateConfigWithRedisDBConfig(t *testing.T) {
+	cfg, err := LoadConf("testdata/redis_db_config.yml")
+	require.NoError(t, err)
+	require.NoError(t, ValidateConfig(cfg))
 }
