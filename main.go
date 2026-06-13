@@ -137,7 +137,7 @@ func main() {
 	})
 
 	g.AddRunningJob(func(ctx context.Context) error {
-		return rpc.RunGRPCServer(ctx, cfg)
+		return rpc.RunGRPCServer(ctx, cfg, q)
 	})
 
 	<-g.Done()

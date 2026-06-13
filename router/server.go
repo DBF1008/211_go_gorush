@@ -94,7 +94,7 @@ func pushHandler(cfg *config.ConfYaml, q *queue.Queue) gin.HandlerFunc {
 		// https://github.com/appleboy/gorush/issues/518
 		ctx := c.Request.Context()
 
-		counts, logs := handleNotification(ctx, cfg, form, q)
+		counts, logs := HandleNotification(ctx, cfg, form, q)
 
 		c.JSON(http.StatusOK, gin.H{
 			"success": "ok",
@@ -220,8 +220,8 @@ func routerEngine(cfg *config.ConfYaml, q *queue.Queue) *gin.Engine {
 	return r
 }
 
-// markFailedNotification adds failure logs for all tokens in push notification
-func markFailedNotification(
+// MarkFailedNotification adds failure logs for all tokens in push notification
+func MarkFailedNotification(
 	cfg *config.ConfYaml,
 	notification *notify.PushNotification,
 	reason string,
@@ -244,8 +244,8 @@ func markFailedNotification(
 	return logs
 }
 
-// isPlatformEnabled checks if the notification platform is enabled in config.
-func isPlatformEnabled(cfg *config.ConfYaml, platform int) bool {
+// IsPlatformEnabled checks if the notification platform is enabled in config.
+func IsPlatformEnabled(cfg *config.ConfYaml, platform int) bool {
 	switch platform {
 	case core.PlatFormIos:
 		return cfg.Ios.Enabled
@@ -258,21 +258,21 @@ func isPlatformEnabled(cfg *config.ConfYaml, platform int) bool {
 	}
 }
 
-// filterEnabledNotifications filters notifications to only those with enabled platforms.
-func filterEnabledNotifications(
+// FilterEnabledNotifications filters notifications to only those with enabled platforms.
+func FilterEnabledNotifications(
 	cfg *config.ConfYaml, notifications []notify.PushNotification,
 ) []*notify.PushNotification {
 	result := make([]*notify.PushNotification, 0, len(notifications))
 	for i := range notifications {
-		if isPlatformEnabled(cfg, notifications[i].Platform) {
+		if IsPlatformEnabled(cfg, notifications[i].Platform) {
 			result = append(result, &notifications[i])
 		}
 	}
 	return result
 }
 
-// countNotificationTargets counts the total number of targets (tokens + topics) in a notification.
-func countNotificationTargets(notification *notify.PushNotification) int {
+// CountNotificationTargets counts the total number of targets (tokens + topics) in a notification.
+func CountNotificationTargets(notification *notify.PushNotification) int {
 	count := len(notification.Tokens)
 	if notification.Topic != "" {
 		count++
@@ -281,7 +281,7 @@ func countNotificationTargets(notification *notify.PushNotification) int {
 }
 
 // HandleNotification add notification to queue list.
-func handleNotification(
+func HandleNotification(
 	_ context.Context,
 	cfg *config.ConfYaml,
 	req notify.RequestPush,
@@ -291,7 +291,7 @@ func handleNotification(
 		cfg.Core.Sync = false
 	}
 
-	notifications := filterEnabledNotifications(cfg, req.Notifications)
+	notifications := FilterEnabledNotifications(cfg, req.Notifications)
 	isLocalSync := core.IsLocalQueue(core.Queue(cfg.Queue.Engine)) && cfg.Core.Sync
 
 	var (
@@ -320,12 +320,12 @@ func handleNotification(
 				}
 			}(notification, cfg)
 		} else if err := q.Queue(notification); err != nil {
-			resp := markFailedNotification(cfg, notification, "max capacity reached")
+			resp := MarkFailedNotification(cfg, notification, "max capacity reached")
 			logs = append(logs, resp...)
 			wg.Done()
 		}
 
-		count += countNotificationTargets(notification)
+		count += CountNotificationTargets(notification)
 	}
 
 	if cfg.Core.Sync {

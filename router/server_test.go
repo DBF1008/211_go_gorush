@@ -513,7 +513,7 @@ func TestSenMultipleNotifications(t *testing.T) {
 		},
 	}
 
-	count, logs := handleNotification(ctx, cfg, req, q)
+	count, logs := HandleNotification(ctx, cfg, req, q)
 	assert.Equal(t, 3, count)
 	assert.Empty(t, logs)
 }
@@ -551,7 +551,7 @@ func TestDisabledAndroidNotifications(t *testing.T) {
 		},
 	}
 
-	count, logs := handleNotification(ctx, cfg, req, q)
+	count, logs := HandleNotification(ctx, cfg, req, q)
 	assert.Equal(t, 1, count)
 	assert.Empty(t, logs)
 }
@@ -592,7 +592,7 @@ func TestSyncModeForNotifications(t *testing.T) {
 		},
 	}
 
-	count, logs := handleNotification(ctx, cfg, req, q)
+	count, logs := HandleNotification(ctx, cfg, req, q)
 	assert.Equal(t, 3, count)
 	assert.Len(t, logs, 3)
 }
@@ -635,7 +635,7 @@ func TestSyncModeForTopicNotification(t *testing.T) {
 		},
 	}
 
-	count, logs := handleNotification(ctx, cfg, req, q)
+	count, logs := HandleNotification(ctx, cfg, req, q)
 	assert.Equal(t, 2, count)
 	assert.Empty(t, logs)
 }
@@ -663,7 +663,7 @@ func TestSyncModeForDeviceGroupNotification(t *testing.T) {
 	}
 
 	// success
-	count, logs := handleNotification(ctx, cfg, req, q)
+	count, logs := HandleNotification(ctx, cfg, req, q)
 	assert.Equal(t, 1, count)
 	assert.Empty(t, logs)
 }
@@ -701,7 +701,7 @@ func TestDisabledIosNotifications(t *testing.T) {
 		},
 	}
 
-	count, logs := handleNotification(ctx, cfg, req, q)
+	count, logs := HandleNotification(ctx, cfg, req, q)
 	assert.Equal(t, 2, count)
 	assert.Empty(t, logs)
 }
@@ -768,7 +768,7 @@ func TestIsPlatformEnabled(t *testing.T) {
 			cfg.Android.Enabled = tt.androidEnabled
 			cfg.Huawei.Enabled = tt.huaweiEnabled
 
-			got := isPlatformEnabled(cfg, tt.platform)
+			got := IsPlatformEnabled(cfg, tt.platform)
 			assert.Equal(t, tt.want, got)
 		})
 	}
@@ -787,7 +787,7 @@ func TestFilterEnabledNotifications(t *testing.T) {
 		{Platform: core.PlatFormIos, Message: "iOS message 2"},
 	}
 
-	result := filterEnabledNotifications(cfg, notifications)
+	result := FilterEnabledNotifications(cfg, notifications)
 
 	assert.Len(t, result, 3)
 	assert.Equal(t, "iOS message", result[0].Message)
@@ -806,7 +806,7 @@ func TestFilterEnabledNotificationsAllDisabled(t *testing.T) {
 		{Platform: core.PlatFormAndroid, Message: "Android message"},
 	}
 
-	result := filterEnabledNotifications(cfg, notifications)
+	result := FilterEnabledNotifications(cfg, notifications)
 
 	assert.Empty(t, result)
 }
@@ -848,7 +848,7 @@ func TestCountNotificationTargets(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			got := countNotificationTargets(tt.notification)
+			got := CountNotificationTargets(tt.notification)
 			assert.Equal(t, tt.want, got)
 		})
 	}

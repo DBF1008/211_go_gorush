@@ -16,11 +16,13 @@ import (
 	"github.com/appleboy/gorush/core"
 	"github.com/appleboy/gorush/logx"
 	"github.com/appleboy/gorush/notify"
+	"github.com/appleboy/gorush/router"
 	"github.com/appleboy/gorush/rpc/proto"
 
 	grpc_middleware "github.com/grpc-ecosystem/go-grpc-middleware"
 	grpc_recovery "github.com/grpc-ecosystem/go-grpc-middleware/recovery"
 	grpc_prometheus "github.com/grpc-ecosystem/go-grpc-prometheus"
+	"github.com/golang-queue/queue"
 	"go.opencensus.io/plugin/ocgrpc"
 	"google.golang.org/grpc"
 	"google.golang.org/grpc/codes"
@@ -32,15 +34,17 @@ import (
 // Server is used to implement gorush grpc server.
 type Server struct {
 	cfg *config.ConfYaml
+	q   *queue.Queue
 	mu  sync.Mutex
 	// statusMap stores the serving status of the services this Server monitors.
 	statusMap map[string]proto.HealthCheckResponse_ServingStatus
 }
 
 // NewServer returns a new Server.
-func NewServer(cfg *config.ConfYaml) *Server {
+func NewServer(cfg *config.ConfYaml, q *queue.Queue) *Server {
 	return &Server{
 		cfg:       cfg,
+		q:         q,
 		statusMap: make(map[string]proto.HealthCheckResponse_ServingStatus),
 	}
 }
@@ -66,7 +70,7 @@ func (s *Server) Check(
 	return nil, status.Error(codes.NotFound, "unknown service")
 }
 
-// Send implements helloworld.GreeterServer
+// Send implements gorush.GorushServer
 func (s *Server) Send(
 	ctx context.Context,
 	in *proto.NotificationRequest,
@@ -123,22 +127,35 @@ func (s *Server) Send(
 		}
 	}
 
-	go func() {
-		ctx := context.Background()
-		_, err := notify.SendNotification(ctx, &notification, s.cfg)
-		if err != nil {
-			logx.LogError.Error(err)
-		}
-	}()
-
-	counts, err := safeIntToInt32(len(notification.Tokens))
-	if err != nil {
+	// Validate message format (same as HTTP path's CheckMessage).
+	if err := notify.CheckMessage(&notification); err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
 
+	// Delegate to shared handler that performs platform filtering,
+	// queueing, sync/async dispatch, stat counting and failure logging —
+	// exactly the same pipeline as the HTTP /api/push endpoint.
+	req := notify.RequestPush{
+		Notifications: []notify.PushNotification{notification},
+	}
+	counts, logs := router.HandleNotification(ctx, s.cfg, req, s.q)
+
+	success := true
+	for _, l := range logs {
+		if l.Type == core.FailedPush {
+			success = false
+			break
+		}
+	}
+
+	c32, err := safeIntToInt32(counts)
+	if err != nil {
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
 	return &proto.NotificationReply{
-		Success: true,
-		Counts:  counts,
+		Success: success,
+		Counts:  c32,
 	}, nil
 }
 
@@ -151,7 +168,7 @@ func safeIntToInt32(n int) (int32, error) {
 }
 
 // RunGRPCServer run gorush grpc server
-func RunGRPCServer(ctx context.Context, cfg *config.ConfYaml) error {
+func RunGRPCServer(ctx context.Context, cfg *config.ConfYaml, q *queue.Queue) error {
 	if !cfg.GRPC.Enabled {
 		logx.LogAccess.Info("gRPC server is disabled.")
 		return nil
@@ -196,7 +213,7 @@ func RunGRPCServer(ctx context.Context, cfg *config.ConfYaml) error {
 		)
 	}
 
-	rpcSrv := NewServer(cfg)
+	rpcSrv := NewServer(cfg, q)
 	proto.RegisterGorushServer(s, rpcSrv)
 	proto.RegisterHealthServer(s, rpcSrv)
 
