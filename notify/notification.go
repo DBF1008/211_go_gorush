@@ -184,6 +184,30 @@ func CheckMessage(req *PushNotification) error {
 	return nil
 }
 
+// IsPlatformEnabled reports whether the given push platform is enabled in cfg.
+func IsPlatformEnabled(cfg *config.ConfYaml, platform int) bool {
+	switch platform {
+	case core.PlatFormIos:
+		return cfg.Ios.Enabled
+	case core.PlatFormAndroid:
+		return cfg.Android.Enabled
+	case core.PlatFormHuawei:
+		return cfg.Huawei.Enabled
+	default:
+		return false
+	}
+}
+
+// CountNotificationTargets counts the total number of targets (tokens + topic)
+// in a notification.
+func CountNotificationTargets(n *PushNotification) int {
+	count := len(n.Tokens)
+	if n.Topic != "" {
+		count++
+	}
+	return count
+}
+
 // SetProxy only working for FCM server.
 func SetProxy(proxy string) error {
 	proxyURL, err := url.ParseRequestURI(proxy)

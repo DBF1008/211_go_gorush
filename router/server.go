@@ -244,40 +244,17 @@ func markFailedNotification(
 	return logs
 }
 
-// isPlatformEnabled checks if the notification platform is enabled in config.
-func isPlatformEnabled(cfg *config.ConfYaml, platform int) bool {
-	switch platform {
-	case core.PlatFormIos:
-		return cfg.Ios.Enabled
-	case core.PlatFormAndroid:
-		return cfg.Android.Enabled
-	case core.PlatFormHuawei:
-		return cfg.Huawei.Enabled
-	default:
-		return false
-	}
-}
-
 // filterEnabledNotifications filters notifications to only those with enabled platforms.
 func filterEnabledNotifications(
 	cfg *config.ConfYaml, notifications []notify.PushNotification,
 ) []*notify.PushNotification {
 	result := make([]*notify.PushNotification, 0, len(notifications))
 	for i := range notifications {
-		if isPlatformEnabled(cfg, notifications[i].Platform) {
+		if notify.IsPlatformEnabled(cfg, notifications[i].Platform) {
 			result = append(result, &notifications[i])
 		}
 	}
 	return result
-}
-
-// countNotificationTargets counts the total number of targets (tokens + topics) in a notification.
-func countNotificationTargets(notification *notify.PushNotification) int {
-	count := len(notification.Tokens)
-	if notification.Topic != "" {
-		count++
-	}
-	return count
 }
 
 // HandleNotification add notification to queue list.
@@ -325,7 +302,7 @@ func handleNotification(
 			wg.Done()
 		}
 
-		count += countNotificationTargets(notification)
+		count += notify.CountNotificationTargets(notification)
 	}
 
 	if cfg.Core.Sync {

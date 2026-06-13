@@ -13,7 +13,6 @@ import (
 
 	"firebase.google.com/go/v4/messaging"
 	"github.com/appleboy/gorush/config"
-	"github.com/appleboy/gorush/core"
 	"github.com/appleboy/gorush/logx"
 	"github.com/appleboy/gorush/notify"
 	"github.com/appleboy/gorush/rpc/proto"
@@ -35,6 +34,10 @@ type Server struct {
 	mu  sync.Mutex
 	// statusMap stores the serving status of the services this Server monitors.
 	statusMap map[string]proto.HealthCheckResponse_ServingStatus
+	// send dispatches a notification. It defaults to notify.SendNotification and
+	// is overridable in tests to exercise the success/failure result mapping
+	// without contacting real push services.
+	send func(ctx context.Context, n *notify.PushNotification, cfg *config.ConfYaml) (*notify.ResponsePush, error)
 }
 
 // NewServer returns a new Server.
@@ -42,6 +45,9 @@ func NewServer(cfg *config.ConfYaml) *Server {
 	return &Server{
 		cfg:       cfg,
 		statusMap: make(map[string]proto.HealthCheckResponse_ServingStatus),
+		send: func(ctx context.Context, n *notify.PushNotification, cfg *config.ConfYaml) (*notify.ResponsePush, error) {
+			return notify.SendNotification(ctx, n, cfg)
+		},
 	}
 }
 
@@ -66,7 +72,12 @@ func (s *Server) Check(
 	return nil, status.Error(codes.NotFound, "unknown service")
 }
 
-// Send implements helloworld.GreeterServer
+// Send implements the gorush gRPC push entry point. It mirrors the HTTP/CLI
+// semantics: the request is validated, the target platform must be enabled, and
+// the notification is dispatched synchronously so the reply reflects the actual
+// outcome. Failures surface as gRPC status errors. Per-token delivery failures
+// are logged by the platform push functions and do not fail the call (matching
+// the HTTP entry, whose reply has no per-token error channel either).
 func (s *Server) Send(
 	ctx context.Context,
 	in *proto.NotificationRequest,
@@ -94,10 +105,6 @@ func (s *Server) Send(
 		notification.Badge = &badge
 	}
 
-	if in.Topic != "" && in.Platform == core.PlatFormAndroid {
-		notification.Topic = in.Topic
-	}
-
 	if in.Alert != nil {
 		notification.Alert = notify.Alert{
 			Title:        in.Alert.Title,
@@ -123,15 +130,24 @@ func (s *Server) Send(
 		}
 	}
 
-	go func() {
-		ctx := context.Background()
-		_, err := notify.SendNotification(ctx, &notification, s.cfg)
-		if err != nil {
-			logx.LogError.Error(err)
-		}
-	}()
+	// Validate the request the same way the HTTP/CLI entry points do.
+	if err := notify.CheckMessage(&notification); err != nil {
+		return nil, status.Error(codes.InvalidArgument, err.Error())
+	}
 
-	counts, err := safeIntToInt32(len(notification.Tokens))
+	// Reject platforms that are not enabled instead of silently sending.
+	if !notify.IsPlatformEnabled(s.cfg, notification.Platform) {
+		return nil, status.Error(codes.FailedPrecondition, "platform is not enabled")
+	}
+
+	// Dispatch synchronously so the reply reflects the real outcome. The RPC
+	// context is propagated so client cancellation/deadlines apply.
+	if _, err := s.send(ctx, &notification, s.cfg); err != nil {
+		logx.LogError.Error(err)
+		return nil, status.Error(codes.Internal, err.Error())
+	}
+
+	counts, err := safeIntToInt32(notify.CountNotificationTargets(&notification))
 	if err != nil {
 		return nil, status.Error(codes.InvalidArgument, err.Error())
 	}
