@@ -1,6 +1,6 @@
 module github.com/appleboy/gorush
 
-go 1.25.9
+go 1.25.10
 
 replace github.com/msalihkarakasli/go-hms-push => github.com/spawn2kill/go-hms-push v0.0.0-20211125124117-e20af53b1304
 
@@ -10,7 +10,7 @@ require (
 	github.com/appleboy/gin-status-api v1.2.0
 	github.com/appleboy/go-fcm v1.2.7
 	github.com/appleboy/go-hms-push v1.0.1
-	github.com/appleboy/gofight/v2 v2.2.1
+	github.com/appleboy/gofight/v2 v2.2.2
 	github.com/appleboy/graceful v1.3.0
 	github.com/asdine/storm/v3 v3.2.1
 	github.com/buger/jsonparser v1.1.2

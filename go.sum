@@ -58,8 +58,8 @@ github.com/appleboy/go-fcm v1.2.7 h1:1HFLCSH/HyAPOTVsmWCL1UPSJ+lKr5t60kCXd2F4KlY
 github.com/appleboy/go-fcm v1.2.7/go.mod h1:HbdeRIVWOdoHHTV9TXkEQKa6f9Bg+xJSjgUCYXAjPwU=
 github.com/appleboy/go-hms-push v1.0.1 h1:55v173UvjgZgmaj/D+X+y82WLuA+xl4SYHCF8Zb5WtM=
 github.com/appleboy/go-hms-push v1.0.1/go.mod h1:JZzS7XUOFTUV8y+MAnDjOIv0LCZmLmVpJj//Q9t0XBw=
-github.com/appleboy/gofight/v2 v2.2.1 h1:OOJrZ71tdOFDzyyBvP+h047w0EJHktqTo4mEOTDrKy0=
-github.com/appleboy/gofight/v2 v2.2.1/go.mod h1:dOz1A3YtfciapH897IQOAR6JfTFm0nwJctaDuJZiijY=
+github.com/appleboy/gofight/v2 v2.2.2 h1:rQcLkVa3bq81UeWNrqqw1Cg34Z1DtsSIhtkFu81cK5I=
+github.com/appleboy/gofight/v2 v2.2.2/go.mod h1:vNptRBbR0fFvnryIrof1kyANz5fprVJxTTEmMV4S1AY=
 github.com/appleboy/graceful v1.3.0 h1:IU5In15N4z0qkTAVnuKH/KZv3iat5lsS1pbTsDB1LzU=
 github.com/appleboy/graceful v1.3.0/go.mod h1:XlEg3jkgb42weJeCXch3HRXvWrU5r+EYymCyPVy0EkA=
 github.com/asdine/storm/v3 v3.2.1 h1:I5AqhkPK6nBZ/qJXySdI7ot5BlXSZ7qvDY1zAn5ZJac=
