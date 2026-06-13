@@ -2,9 +2,11 @@ package config
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"log"
 	"net"
+	"net/url"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -427,7 +429,163 @@ func ValidatePIDPath(pidPath string) error {
 	return nil
 }
 
-// ValidateConfig validates critical configuration parameters
+// validEngine reports whether value is one of the allowed engine names.
+func validEngine(value string, allowed ...string) bool {
+	for _, a := range allowed {
+		if value == a {
+			return true
+		}
+	}
+	return false
+}
+
+// validateHostPort validates a "host:port" address: the host must be a valid
+// IP/hostname and the port must be a valid, non-empty port number.
+func validateHostPort(addr string) error {
+	host, port, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("invalid address format: %s", addr)
+	}
+	if err := ValidateAddress(host); err != nil {
+		return err
+	}
+	if port == "" {
+		return fmt.Errorf("missing port in address: %s", addr)
+	}
+	return ValidatePort(port)
+}
+
+// validateQueueAddr validates a queue backend address. It accepts an optional
+// "scheme://" prefix (e.g. nats://) and a comma-separated list of host:port
+// entries (e.g. a multi-node NATS cluster), validating each entry.
+func validateQueueAddr(addr string) error {
+	if addr == "" {
+		return errors.New("address can't be empty")
+	}
+	for _, entry := range strings.Split(addr, ",") {
+		entry = strings.TrimSpace(entry)
+		// Strip an optional scheme:// prefix before host:port validation.
+		if i := strings.Index(entry, "://"); i != -1 {
+			entry = entry[i+len("://"):]
+		}
+		if err := validateHostPort(entry); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+// ValidateGRPCConfig validates the gRPC server settings consumed by
+// rpc.RunGRPCServer.
+func ValidateGRPCConfig(cfg *ConfYaml) error {
+	if err := ValidatePort(cfg.GRPC.Port); err != nil {
+		return fmt.Errorf("invalid gRPC port: %w", err)
+	}
+	return nil
+}
+
+// ValidateQueueConfig validates the queue engine and its backend address
+// consumed by app.NewQueueWorker. An empty engine is treated as unset (the
+// default engine is applied later).
+func ValidateQueueConfig(cfg *ConfYaml) error {
+	engine := cfg.Queue.Engine
+	if engine == "" {
+		return nil
+	}
+	if !validEngine(engine, "local", "nsq", "nats", "redis") {
+		return fmt.Errorf("invalid queue engine: %s", engine)
+	}
+
+	switch engine {
+	case "nsq":
+		if err := validateQueueAddr(cfg.Queue.NSQ.Addr); err != nil {
+			return fmt.Errorf("invalid NSQ address: %w", err)
+		}
+	case "nats":
+		if err := validateQueueAddr(cfg.Queue.NATS.Addr); err != nil {
+			return fmt.Errorf("invalid NATS address: %w", err)
+		}
+	case "redis":
+		if err := validateQueueAddr(cfg.Queue.Redis.Addr); err != nil {
+			return fmt.Errorf("invalid Redis queue address: %w", err)
+		}
+	}
+	return nil
+}
+
+// ValidateFeedbackConfig validates the feedback webhook settings consumed by
+// notify.DispatchFeedback. Validation only runs when a feedback URL is set.
+func ValidateFeedbackConfig(cfg *ConfYaml) error {
+	if cfg.Core.FeedbackURL == "" {
+		return nil
+	}
+
+	u, err := url.Parse(cfg.Core.FeedbackURL)
+	if err != nil {
+		return fmt.Errorf("invalid feedback hook URL: %w", err)
+	}
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return fmt.Errorf(
+			"feedback hook URL must use http or https scheme: %s",
+			cfg.Core.FeedbackURL,
+		)
+	}
+	if u.Host == "" {
+		return fmt.Errorf("feedback hook URL must include a host: %s", cfg.Core.FeedbackURL)
+	}
+	if cfg.Core.FeedbackTimeout <= 0 {
+		return fmt.Errorf(
+			"feedback timeout must be positive, got %d",
+			cfg.Core.FeedbackTimeout,
+		)
+	}
+	return nil
+}
+
+// ValidateTLSConfig validates the TLS and AutoTLS settings consumed by the HTTP
+// and gRPC servers, so that an SSL or AutoTLS misconfiguration fails at startup
+// rather than when the server begins listening.
+func ValidateTLSConfig(cfg *ConfYaml) error {
+	if cfg.Core.AutoTLS.Enabled && cfg.Core.AutoTLS.Host == "" {
+		return errors.New("auto_tls is enabled but auto_tls.host is empty")
+	}
+
+	if cfg.Core.SSL {
+		hasFilePair := cfg.Core.CertPath != "" && cfg.Core.KeyPath != ""
+		hasBase64Pair := cfg.Core.CertBase64 != "" && cfg.Core.KeyBase64 != ""
+		if !hasFilePair && !hasBase64Pair {
+			return errors.New(
+				"ssl is enabled but no certificate/key pair " +
+					"(cert_path+key_path or cert_base64+key_base64) is configured",
+			)
+		}
+	}
+	return nil
+}
+
+// ValidateStatConfig validates the stat storage engine consumed by
+// status.InitAppStatus. An empty engine is treated as unset (the default engine
+// is applied later).
+func ValidateStatConfig(cfg *ConfYaml) error {
+	engine := cfg.Stat.Engine
+	if engine == "" {
+		return nil
+	}
+	if !validEngine(engine, "memory", "redis", "boltdb", "buntdb", "leveldb", "badger") {
+		return fmt.Errorf("invalid stat engine: %s", engine)
+	}
+
+	if engine == "redis" && cfg.Stat.Redis.Addr != "" {
+		if err := validateHostPort(cfg.Stat.Redis.Addr); err != nil {
+			return fmt.Errorf("invalid Redis address: %w", err)
+		}
+	}
+	return nil
+}
+
+// ValidateConfig validates the full configuration before startup so that bad
+// values are rejected up front in a single pass, rather than failing later
+// inside the HTTP, gRPC, queue, or feedback subsystems once they start.
 func ValidateConfig(cfg *ConfYaml) error {
 	if err := ValidatePort(cfg.Core.Port); err != nil {
 		return fmt.Errorf("invalid core port: %w", err)
@@ -441,18 +599,24 @@ func ValidateConfig(cfg *ConfYaml) error {
 		return fmt.Errorf("invalid PID path: %w", err)
 	}
 
-	// Validate Redis address if Redis is enabled
-	if cfg.Stat.Engine == "redis" && cfg.Stat.Redis.Addr != "" {
-		host, port, err := net.SplitHostPort(cfg.Stat.Redis.Addr)
-		if err != nil {
-			return fmt.Errorf("invalid Redis address format: %s", cfg.Stat.Redis.Addr)
-		}
-		if err := ValidateAddress(host); err != nil {
-			return fmt.Errorf("invalid Redis host: %w", err)
-		}
-		if err := ValidatePort(port); err != nil {
-			return fmt.Errorf("invalid Redis port: %w", err)
-		}
+	if err := ValidateGRPCConfig(cfg); err != nil {
+		return err
+	}
+
+	if err := ValidateTLSConfig(cfg); err != nil {
+		return err
+	}
+
+	if err := ValidateQueueConfig(cfg); err != nil {
+		return err
+	}
+
+	if err := ValidateFeedbackConfig(cfg); err != nil {
+		return err
+	}
+
+	if err := ValidateStatConfig(cfg); err != nil {
+		return err
 	}
 
 	return nil

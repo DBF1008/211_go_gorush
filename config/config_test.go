@@ -777,3 +777,422 @@ func TestSanitizedCopyEmptyFields(t *testing.T) {
 	assert.Empty(t, sanitized.Stat.Redis.Username)
 	assert.Empty(t, sanitized.Stat.Redis.Password)
 }
+
+// checkValidationErr asserts the error returned by a validator matches the
+// expectation of the table-driven test case.
+func checkValidationErr(t *testing.T, err error, wantErr bool, errMsg string) {
+	t.Helper()
+	if wantErr {
+		require.Error(t, err)
+		if errMsg != "" {
+			assert.Contains(t, err.Error(), errMsg)
+		}
+		return
+	}
+	require.NoError(t, err)
+}
+
+func TestValidateGRPCConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		port    string
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "empty port uses default", port: "", wantErr: false},
+		{name: "valid port", port: "9000", wantErr: false},
+		{name: "out of range port", port: "99999", wantErr: true, errMsg: "invalid gRPC port"},
+		{name: "non-numeric port", port: "abc", wantErr: true, errMsg: "invalid gRPC port"},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ConfYaml{}
+			cfg.GRPC.Port = tt.port
+			checkValidationErr(t, ValidateGRPCConfig(cfg), tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+func TestValidateQueueConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(*ConfYaml)
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "empty engine uses default", setup: func(c *ConfYaml) {}, wantErr: false},
+		{
+			name:    "local engine needs no address",
+			setup:   func(c *ConfYaml) { c.Queue.Engine = "local" },
+			wantErr: false,
+		},
+		{
+			name:    "unknown engine",
+			setup:   func(c *ConfYaml) { c.Queue.Engine = "kafka" },
+			wantErr: true,
+			errMsg:  "invalid queue engine",
+		},
+		{
+			name: "valid nsq address",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "nsq"
+				c.Queue.NSQ.Addr = "127.0.0.1:4150"
+			},
+			wantErr: false,
+		},
+		{
+			name: "nsq address missing port",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "nsq"
+				c.Queue.NSQ.Addr = "127.0.0.1"
+			},
+			wantErr: true,
+			errMsg:  "invalid NSQ address",
+		},
+		{
+			name: "nsq address out of range port",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "nsq"
+				c.Queue.NSQ.Addr = "127.0.0.1:99999"
+			},
+			wantErr: true,
+			errMsg:  "invalid NSQ address",
+		},
+		{
+			name: "nats address with scheme",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "nats"
+				c.Queue.NATS.Addr = "nats://127.0.0.1:4222"
+			},
+			wantErr: false,
+		},
+		{
+			name: "nats multi-node cluster",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "nats"
+				c.Queue.NATS.Addr = "127.0.0.1:4222,127.0.0.1:4223"
+			},
+			wantErr: false,
+		},
+		{
+			name: "nats empty address",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "nats"
+				c.Queue.NATS.Addr = ""
+			},
+			wantErr: true,
+			errMsg:  "invalid NATS address",
+		},
+		{
+			name: "valid redis queue address",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "redis"
+				c.Queue.Redis.Addr = "127.0.0.1:6379"
+			},
+			wantErr: false,
+		},
+		{
+			name: "redis queue address missing port",
+			setup: func(c *ConfYaml) {
+				c.Queue.Engine = "redis"
+				c.Queue.Redis.Addr = "127.0.0.1"
+			},
+			wantErr: true,
+			errMsg:  "invalid Redis queue address",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ConfYaml{}
+			tt.setup(cfg)
+			checkValidationErr(t, ValidateQueueConfig(cfg), tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+func TestValidateFeedbackConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		url     string
+		timeout int64
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "empty url skips validation", url: "", timeout: 0, wantErr: false},
+		{name: "valid http url", url: "http://example.com/hook", timeout: 10, wantErr: false},
+		{name: "valid https url", url: "https://example.com/hook", timeout: 5, wantErr: false},
+		{
+			name:    "missing scheme",
+			url:     "example.com/hook",
+			timeout: 10,
+			wantErr: true,
+			errMsg:  "scheme",
+		},
+		{
+			name:    "unsupported scheme",
+			url:     "ftp://example.com/hook",
+			timeout: 10,
+			wantErr: true,
+			errMsg:  "scheme",
+		},
+		{
+			name:    "missing host",
+			url:     "http://",
+			timeout: 10,
+			wantErr: true,
+			errMsg:  "host",
+		},
+		{
+			name:    "zero timeout",
+			url:     "http://example.com/hook",
+			timeout: 0,
+			wantErr: true,
+			errMsg:  "timeout must be positive",
+		},
+		{
+			name:    "negative timeout",
+			url:     "http://example.com/hook",
+			timeout: -1,
+			wantErr: true,
+			errMsg:  "timeout must be positive",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ConfYaml{}
+			cfg.Core.FeedbackURL = tt.url
+			cfg.Core.FeedbackTimeout = tt.timeout
+			checkValidationErr(t, ValidateFeedbackConfig(cfg), tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+func TestValidateTLSConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(*ConfYaml)
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "no tls", setup: func(c *ConfYaml) {}, wantErr: false},
+		{
+			name: "ssl with file cert pair",
+			setup: func(c *ConfYaml) {
+				c.Core.SSL = true
+				c.Core.CertPath = "cert.pem"
+				c.Core.KeyPath = "key.pem"
+			},
+			wantErr: false,
+		},
+		{
+			name: "ssl with base64 cert pair",
+			setup: func(c *ConfYaml) {
+				c.Core.SSL = true
+				c.Core.CertBase64 = "Y2VydA=="
+				c.Core.KeyBase64 = "a2V5"
+			},
+			wantErr: false,
+		},
+		{
+			name: "ssl with only cert path",
+			setup: func(c *ConfYaml) {
+				c.Core.SSL = true
+				c.Core.CertPath = "cert.pem"
+			},
+			wantErr: true,
+			errMsg:  "certificate/key pair",
+		},
+		{
+			name: "ssl without any cert",
+			setup: func(c *ConfYaml) {
+				c.Core.SSL = true
+			},
+			wantErr: true,
+			errMsg:  "certificate/key pair",
+		},
+		{
+			name: "auto tls with host",
+			setup: func(c *ConfYaml) {
+				c.Core.AutoTLS.Enabled = true
+				c.Core.AutoTLS.Host = "example.com"
+			},
+			wantErr: false,
+		},
+		{
+			name: "auto tls without host",
+			setup: func(c *ConfYaml) {
+				c.Core.AutoTLS.Enabled = true
+			},
+			wantErr: true,
+			errMsg:  "auto_tls.host",
+		},
+		{
+			name: "auto tls without host takes precedence over ssl",
+			setup: func(c *ConfYaml) {
+				c.Core.AutoTLS.Enabled = true
+				c.Core.SSL = true
+				c.Core.CertPath = "cert.pem"
+				c.Core.KeyPath = "key.pem"
+			},
+			wantErr: true,
+			errMsg:  "auto_tls.host",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ConfYaml{}
+			tt.setup(cfg)
+			checkValidationErr(t, ValidateTLSConfig(cfg), tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+func TestValidateStatConfig(t *testing.T) {
+	tests := []struct {
+		name    string
+		setup   func(*ConfYaml)
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "empty engine uses default", setup: func(c *ConfYaml) {}, wantErr: false},
+		{name: "memory engine", setup: func(c *ConfYaml) { c.Stat.Engine = "memory" }, wantErr: false},
+		{name: "boltdb engine", setup: func(c *ConfYaml) { c.Stat.Engine = "boltdb" }, wantErr: false},
+		{
+			name:    "unknown engine",
+			setup:   func(c *ConfYaml) { c.Stat.Engine = "mysql" },
+			wantErr: true,
+			errMsg:  "invalid stat engine",
+		},
+		{
+			name: "redis engine valid address",
+			setup: func(c *ConfYaml) {
+				c.Stat.Engine = "redis"
+				c.Stat.Redis.Addr = "localhost:6379"
+			},
+			wantErr: false,
+		},
+		{
+			name: "redis engine empty address skips check",
+			setup: func(c *ConfYaml) {
+				c.Stat.Engine = "redis"
+				c.Stat.Redis.Addr = ""
+			},
+			wantErr: false,
+		},
+		{
+			name: "redis engine address missing port",
+			setup: func(c *ConfYaml) {
+				c.Stat.Engine = "redis"
+				c.Stat.Redis.Addr = "localhost"
+			},
+			wantErr: true,
+			errMsg:  "invalid Redis address",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := &ConfYaml{}
+			tt.setup(cfg)
+			checkValidationErr(t, ValidateStatConfig(cfg), tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+// TestValidateConfigSubsystems verifies that ValidateConfig aggregates every
+// subsystem validator, so a single misconfiguration in any subsystem is caught
+// up front.
+func TestValidateConfigSubsystems(t *testing.T) {
+	validConfig := func() *ConfYaml {
+		cfg := &ConfYaml{}
+		cfg.Core.Port = "8088"
+		cfg.Core.Address = "0.0.0.0"
+		cfg.GRPC.Port = "9000"
+		cfg.Queue.Engine = "redis"
+		cfg.Queue.Redis.Addr = "127.0.0.1:6379"
+		cfg.Core.FeedbackURL = "https://example.com/hook"
+		cfg.Core.FeedbackTimeout = 10
+		cfg.Stat.Engine = "memory"
+		return cfg
+	}
+
+	tests := []struct {
+		name    string
+		mutate  func(*ConfYaml)
+		wantErr bool
+		errMsg  string
+	}{
+		{name: "fully valid config", mutate: func(c *ConfYaml) {}, wantErr: false},
+		{
+			name:    "invalid grpc port",
+			mutate:  func(c *ConfYaml) { c.GRPC.Port = "99999" },
+			wantErr: true,
+			errMsg:  "invalid gRPC port",
+		},
+		{
+			name: "ssl without certs",
+			mutate: func(c *ConfYaml) {
+				c.Core.SSL = true
+			},
+			wantErr: true,
+			errMsg:  "certificate/key pair",
+		},
+		{
+			name:    "auto tls without host",
+			mutate:  func(c *ConfYaml) { c.Core.AutoTLS.Enabled = true },
+			wantErr: true,
+			errMsg:  "auto_tls.host",
+		},
+		{
+			name: "invalid queue address",
+			mutate: func(c *ConfYaml) {
+				c.Queue.Engine = "nsq"
+				c.Queue.NSQ.Addr = "missing-port"
+			},
+			wantErr: true,
+			errMsg:  "invalid NSQ address",
+		},
+		{
+			name:    "invalid feedback url",
+			mutate:  func(c *ConfYaml) { c.Core.FeedbackURL = "not-a-url" },
+			wantErr: true,
+			errMsg:  "scheme",
+		},
+		{
+			name:    "non-positive feedback timeout",
+			mutate:  func(c *ConfYaml) { c.Core.FeedbackTimeout = 0 },
+			wantErr: true,
+			errMsg:  "timeout must be positive",
+		},
+		{
+			name:    "invalid stat engine",
+			mutate:  func(c *ConfYaml) { c.Stat.Engine = "mongo" },
+			wantErr: true,
+			errMsg:  "invalid stat engine",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := validConfig()
+			tt.mutate(cfg)
+			checkValidationErr(t, ValidateConfig(cfg), tt.wantErr, tt.errMsg)
+		})
+	}
+}
+
+// TestValidateConfigDefaults guards the critical invariant that the default
+// configuration and the reference testdata config both pass full validation.
+func TestValidateConfigDefaults(t *testing.T) {
+	defaults, err := LoadConf()
+	require.NoError(t, err)
+	require.NoError(t, ValidateConfig(defaults), "default config must pass validation")
+
+	fromFile, err := LoadConf("testdata/config.yml")
+	require.NoError(t, err)
+	require.NoError(t, ValidateConfig(fromFile), "reference config must pass validation")
+}
