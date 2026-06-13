@@ -474,3 +474,146 @@ func TestGetAndroidNotificationWithTopicAndTokens(t *testing.T) {
 	assert.Equal(t, "token1", messages[1].Token)
 	assert.Equal(t, "token2", messages[2].Token)
 }
+
+// Composable tests: verify that multiple FCM features stack correctly
+// instead of overwriting each other.
+
+func TestComposableContentAvailableAndMutableContent(t *testing.T) {
+	req := &PushNotification{
+		Tokens:           []string{"token"},
+		Title:            "Title",
+		Message:          "Body",
+		ContentAvailable: true,
+		MutableContent:   true,
+		Data:             D{"key": "value"},
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	// Both APNS flags must co-exist (previously content_available clobbered mutable_content).
+	require.NotNil(t, msg.APNS)
+	require.NotNil(t, msg.APNS.Payload)
+	require.NotNil(t, msg.APNS.Payload.Aps)
+	assert.True(t, msg.APNS.Payload.Aps.MutableContent,
+		"mutable_content must survive content_available")
+	assert.True(t, msg.APNS.Payload.Aps.ContentAvailable,
+		"content_available must be set")
+	assert.Equal(t, "5", msg.APNS.Headers["apns-priority"])
+	assert.Equal(t, D{"key": "value"}, D(msg.APNS.Payload.Aps.CustomData))
+
+	// Notification body must still be present.
+	require.NotNil(t, msg.Notification)
+	assert.Equal(t, "Title", msg.Notification.Title)
+	assert.Equal(t, "Body", msg.Notification.Body)
+}
+
+func TestComposableMutableContentSoundAndContentAvailable(t *testing.T) {
+	req := &PushNotification{
+		Tokens:           []string{"token"},
+		Title:            "Title",
+		Message:          "Body",
+		Image:            "https://example.com/image.png",
+		MutableContent:   true,
+		ContentAvailable: true,
+		Sound:            "chime.aiff",
+		Priority:         HIGH,
+		Data:             D{"extra": "data"},
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	// --- APNS: every capability must be present ---
+	require.NotNil(t, msg.APNS)
+	aps := msg.APNS.Payload.Aps
+	assert.True(t, aps.MutableContent, "mutable_content must survive")
+	assert.True(t, aps.ContentAvailable, "content_available must survive")
+	assert.Equal(t, "chime.aiff", aps.Sound, "sound must survive")
+	assert.Equal(t, "5", msg.APNS.Headers["apns-priority"])
+	assert.Equal(t, D{"extra": "data"}, D(aps.CustomData))
+
+	// --- Top-level notification ---
+	require.NotNil(t, msg.Notification)
+	assert.Equal(t, "Title", msg.Notification.Title)
+	assert.Equal(t, "Body", msg.Notification.Body)
+	assert.Equal(t, "https://example.com/image.png", msg.Notification.ImageURL)
+
+	// --- Android: sound and priority must be propagated ---
+	require.NotNil(t, msg.Android)
+	assert.Equal(t, HIGH, msg.Android.Priority)
+	require.NotNil(t, msg.Android.Notification)
+	assert.Equal(t, "chime.aiff", msg.Android.Notification.Sound)
+}
+
+func TestComposablePreservesCallerAPNSHeaders(t *testing.T) {
+	req := &PushNotification{
+		Tokens:           []string{"token"},
+		ContentAvailable: true,
+		APNS: &messaging.APNSConfig{
+			Headers: map[string]string{
+				"apns-push-type": "background",
+				"apns-topic":     "com.example.app",
+			},
+		},
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	require.NotNil(t, msg.APNS)
+	// Caller-supplied headers must be preserved.
+	assert.Equal(t, "background", msg.APNS.Headers["apns-push-type"])
+	assert.Equal(t, "com.example.app", msg.APNS.Headers["apns-topic"])
+	// content-available header must be merged in.
+	assert.Equal(t, "5", msg.APNS.Headers["apns-priority"])
+}
+
+func TestComposableSoundAugmentsExistingAndroidConfig(t *testing.T) {
+	req := &PushNotification{
+		Tokens:   []string{"token"},
+		Sound:    "alert.caf",
+		Priority: HIGH,
+		// Caller pre-sets an Android config with a custom TTL.
+		Android: &messaging.AndroidConfig{
+			TTL: "3600s",
+		},
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	require.NotNil(t, msg.Android)
+	// Caller's TTL must be preserved.
+	assert.Equal(t, "3600s", msg.Android.TTL)
+	// Priority should be filled in from req.Priority.
+	assert.Equal(t, HIGH, msg.Android.Priority)
+	// Sound must be applied.
+	require.NotNil(t, msg.Android.Notification)
+	assert.Equal(t, "alert.caf", msg.Android.Notification.Sound)
+}
+
+func TestComposableSoundDoesNotOverrideExistingAndroidPriority(t *testing.T) {
+	req := &PushNotification{
+		Tokens:   []string{"token"},
+		Sound:    "alert.caf",
+		Priority: HIGH,
+		// Caller explicitly sets a different priority on the Android config.
+		Android: &messaging.AndroidConfig{
+			Priority: "normal",
+		},
+	}
+
+	messages := GetAndroidNotification(req)
+	require.Len(t, messages, 1)
+	msg := messages[0]
+
+	require.NotNil(t, msg.Android)
+	// Caller's explicit priority must NOT be overwritten.
+	assert.Equal(t, "normal", msg.Android.Priority)
+	assert.Equal(t, "alert.caf", msg.Android.Notification.Sound)
+}

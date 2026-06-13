@@ -55,9 +55,37 @@ func InitFCMClient(ctx context.Context, cfg *config.ConfYaml) (*fcm.Client, erro
 	return FCMClient, err
 }
 
+// ensureAPNSConfig guarantees req.APNS is non-nil and returns it.
+// Existing fields are preserved; only nil nested structs are initialized.
+func ensureAPNSConfig(req *PushNotification) *messaging.APNSConfig {
+	if req.APNS == nil {
+		req.APNS = &messaging.APNSConfig{}
+	}
+	if req.APNS.Payload == nil {
+		req.APNS.Payload = &messaging.APNSPayload{}
+	}
+	if req.APNS.Payload.Aps == nil {
+		req.APNS.Payload.Aps = &messaging.Aps{}
+	}
+	return req.APNS
+}
+
+// ensureAndroidConfig guarantees req.Android is non-nil and returns it.
+func ensureAndroidConfig(req *PushNotification) *messaging.AndroidConfig {
+	if req.Android == nil {
+		req.Android = &messaging.AndroidConfig{}
+	}
+	if req.Android.Notification == nil {
+		req.Android.Notification = &messaging.AndroidNotification{}
+	}
+	return req.Android
+}
+
 // setupFCMNotification sets up the notification fields on the request.
+// It incrementally augments the APNS config so that subsequent setup
+// functions (content-available, sound) can safely stack on top.
 func setupFCMNotification(req *PushNotification) {
-	if req.Title == "" && req.Message == "" && req.Image == "" {
+	if req.Title == "" && req.Message == "" && req.Image == "" && !req.MutableContent {
 		return
 	}
 	if req.Notification == nil {
@@ -73,72 +101,54 @@ func setupFCMNotification(req *PushNotification) {
 		req.Notification.ImageURL = req.Image
 	}
 	if req.MutableContent {
-		req.APNS = &messaging.APNSConfig{
-			Payload: &messaging.APNSPayload{
-				Aps: &messaging.Aps{
-					MutableContent: req.MutableContent,
-				},
-			},
-		}
+		apns := ensureAPNSConfig(req)
+		apns.Payload.Aps.MutableContent = true
 	}
 }
 
-// setupFCMContentAvailable sets up the content available config for background notifications.
+// setupFCMContentAvailable sets up the content available config for background
+// notifications. It merges into the existing APNS config rather than replacing
+// it, so fields set by setupFCMNotification (mutable-content, image, etc.) are
+// preserved.
 func setupFCMContentAvailable(req *PushNotification) {
 	if !req.ContentAvailable {
 		return
 	}
-	req.APNS = &messaging.APNSConfig{
-		Headers: map[string]string{
-			"apns-priority": "5",
-		},
-		Payload: &messaging.APNSPayload{
-			Aps: &messaging.Aps{
-				ContentAvailable: req.ContentAvailable,
-				CustomData:       req.Data,
-			},
-		},
+	apns := ensureAPNSConfig(req)
+	// Merge the low-priority header without clobbering any headers that
+	// may already be present (e.g. set by the caller via req.APNS).
+	if apns.Headers == nil {
+		apns.Headers = make(map[string]string)
+	}
+	apns.Headers["apns-priority"] = "5"
+	apns.Payload.Aps.ContentAvailable = true
+	if len(req.Data) > 0 {
+		apns.Payload.Aps.CustomData = req.Data
 	}
 }
 
-// setAPNSSound sets the sound on the APNS config, initializing nested structs as needed.
-func setAPNSSound(req *PushNotification, sound string) {
-	switch {
-	case req.APNS == nil:
-		req.APNS = &messaging.APNSConfig{
-			Payload: &messaging.APNSPayload{
-				Aps: &messaging.Aps{Sound: sound},
-			},
-		}
-	case req.APNS.Payload == nil:
-		req.APNS.Payload = &messaging.APNSPayload{
-			Aps: &messaging.Aps{Sound: sound},
-		}
-	case req.APNS.Payload.Aps == nil:
-		req.APNS.Payload.Aps = &messaging.Aps{Sound: sound}
-	default:
-		req.APNS.Payload.Aps.Sound = sound
-	}
-}
-
-// setupFCMSound sets up the sound configuration for FCM notifications.
+// setupFCMSound sets up the sound configuration for both APNS and Android.
+// It augments any existing APNS / Android config rather than replacing it.
 func setupFCMSound(req *PushNotification) {
 	if req.Sound == nil {
 		return
 	}
 	sound, ok := req.Sound.(string)
-	if !ok {
+	if !ok || sound == "" {
 		return
 	}
-	setAPNSSound(req, sound)
-	if req.Android == nil {
-		req.Android = &messaging.AndroidConfig{
-			Priority: req.Priority,
-			Notification: &messaging.AndroidNotification{
-				Sound: sound,
-			},
-		}
+
+	// APNS sound — stacks on top of mutable-content, content-available, etc.
+	apns := ensureAPNSConfig(req)
+	apns.Payload.Aps.Sound = sound
+
+	// Android sound — preserve an existing Android config and only fill in
+	// the fields that are not already set.
+	android := ensureAndroidConfig(req)
+	if android.Priority == "" {
+		android.Priority = req.Priority
 	}
+	android.Notification.Sound = sound
 }
 
 // convertDataToStringMap converts the request data to a string map.
