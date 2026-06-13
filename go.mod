@@ -14,7 +14,7 @@ require (
 	github.com/appleboy/graceful v1.3.0
 	github.com/asdine/storm/v3 v3.2.1
 	github.com/buger/jsonparser v1.1.2
-	github.com/dgraph-io/badger/v4 v4.9.1
+	github.com/dgraph-io/badger/v4 v4.9.2
 	github.com/gin-contrib/logger v1.2.6
 	github.com/gin-gonic/gin v1.12.0
 	github.com/go-viper/mapstructure/v2 v2.5.0
