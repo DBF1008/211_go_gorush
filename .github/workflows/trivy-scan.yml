@@ -48,7 +48,7 @@ jobs:
           output: 'trivy-dockerhub-results.sarif'
 
       - name: Upload Trivy scan results to GitHub Security tab (Docker Hub)
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.3
         if: always()
         with:
           sarif_file: 'trivy-dockerhub-results.sarif'
@@ -80,7 +80,7 @@ jobs:
           output: 'trivy-ghcr-results.sarif'
 
       - name: Upload Trivy scan results to GitHub Security tab (GHCR)
-        uses: github/codeql-action/upload-sarif@v4
+        uses: github/codeql-action/upload-sarif@v4.37.3
         if: always()
         with:
           sarif_file: 'trivy-ghcr-results.sarif'
